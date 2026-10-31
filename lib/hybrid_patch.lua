@@ -415,7 +415,6 @@ function M.persistRemoteMode(draft, new_mode)
             matched_tab.source = matched_tab.source or {}
             matched_tab.source.remote_mode = new_mode
             TabModel.save(tabs)
-            TabModel.clearOverride()
         end
     end
 
@@ -428,28 +427,6 @@ function M.persistRemoteMode(draft, new_mode)
         if Repo.invalidateAllCache then
             Repo.invalidateAllCache()
         end
-    end
-
-    -- Refresh live bookshelf widget if visible
-    for _, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
-        local ok, m = pcall(require, mod)
-        local bw = ok and m and m.instance and m.instance.bookshelf
-        if bw then
-            if bw._afterChipEdit then
-                pcall(function() bw:_afterChipEdit() end)
-            elseif bw._selectChip then
-                pcall(function() bw:_selectChip(bw.chip) end)
-            end
-            break
-        end
-    end
-
-    local ok_info, InfoMessage = pcall(require, "ui/widget/infomessage")
-    if ok_info and InfoMessage then
-        local msg = (new_mode == "next_book")
-            and _("Remote Content set to: Next Book")
-            or _("Remote Content set to: All Chapters")
-        UIManager:show(InfoMessage:new{ text = msg, timeout = 2 })
     end
 end
 
@@ -576,6 +553,8 @@ function M.patchCatalogSettings(Editor)
                     text = mode_text,
                     callback = function()
                         local new_mode = (draft.source and draft.source.remote_mode == "next_book") and "all" or "next_book"
+                        draft.source = draft.source or {}
+                        draft.source.remote_mode = new_mode
                         M.persistRemoteMode(draft, new_mode)
                         if on_close then on_close() end
                         reopen()
@@ -717,6 +696,8 @@ function M.installEditorPatch()
                             callback = function()
                                 local s = draft_found.source or {}
                                 local new_mode = (s.remote_mode == "next_book") and "all" or "next_book"
+                                draft_found.source = draft_found.source or {}
+                                draft_found.source.remote_mode = new_mode
                                 M.persistRemoteMode(draft_found, new_mode)
                                 if apply_preview_fn then apply_preview_fn(true) end
                                 if rebuild_fn then rebuild_fn() end

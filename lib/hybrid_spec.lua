@@ -567,11 +567,13 @@ local SPEC = {
                             if source.remote_mode == nil and t.source.remote_mode ~= nil then
                                 source.remote_mode = t.source.remote_mode
                             end
-                            break
                         end
                     end
                 end
             end
+        end
+        if source.remote_mode == nil then
+            source.remote_mode = "all"
         end
         filter = filter or {}
         sort_priority = sort_priority or { { key = "filename", reverse = false } }
