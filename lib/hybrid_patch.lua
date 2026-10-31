@@ -332,6 +332,127 @@ end
 -- 2. Patch BookshelfChipEditor for Sort Rows, Filters, and Catalog Settings
 -- ---------------------------------------------------------------------------
 
+function M.persistRemoteMode(draft, new_mode)
+    if not draft then return end
+    draft.source = draft.source or {}
+    draft.source.remote_mode = new_mode
+
+    local ok_tm, TabModel = pcall(require, "lib/bookshelf_tab_model")
+    if ok_tm and TabModel and TabModel.load then
+        local tabs = TabModel.load()
+        local matched_tab = nil
+
+        -- Match 1: draft.id
+        if draft.id then
+            for _, t in ipairs(tabs) do
+                if t.id == draft.id then
+                    matched_tab = t
+                    break
+                end
+            end
+        end
+
+        -- Match 2: by active bookshelf chip
+        if not matched_tab then
+            for _, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
+                local ok, m = pcall(require, mod)
+                local bw = ok and m and m.instance and m.instance.bookshelf
+                if bw and bw.chip then
+                    for _, t in ipairs(tabs) do
+                        if t.id == bw.chip then
+                            matched_tab = t
+                            break
+                        end
+                    end
+                end
+                if matched_tab then break end
+            end
+        end
+
+        -- Match 3: any hybrid tab matching source (handling library_id as table or string)
+        if not matched_tab and draft.source then
+            local function same_lib(l1, l2)
+                if l1 == l2 then return true end
+                if type(l1) == "table" and type(l2) == "table" then
+                    return l1[1] and l1[1] == l2[1]
+                end
+                if type(l1) == "table" and type(l2) == "string" then
+                    return l1[1] == l2
+                end
+                if type(l1) == "string" and type(l2) == "table" then
+                    return l1 == l2[1]
+                end
+                return false
+            end
+
+            for _, t in ipairs(tabs) do
+                if t.source and t.source.kind == "hybrid" then
+                    if t.source == draft.source then
+                        matched_tab = t
+                        break
+                    elseif draft.source.library_id and t.source.library_id and same_lib(draft.source.library_id, t.source.library_id) then
+                        matched_tab = t
+                        break
+                    elseif not draft.source.library_id and not t.source.library_id and t.source.local_folder == draft.source.local_folder then
+                        matched_tab = t
+                        break
+                    end
+                end
+            end
+        end
+
+        -- Match 4: fallback to first hybrid tab
+        if not matched_tab then
+            for _, t in ipairs(tabs) do
+                if t.source and t.source.kind == "hybrid" then
+                    matched_tab = t
+                    break
+                end
+            end
+        end
+
+        if matched_tab then
+            matched_tab.source = matched_tab.source or {}
+            matched_tab.source.remote_mode = new_mode
+            TabModel.save(tabs)
+            TabModel.clearOverride()
+        end
+    end
+
+    -- Invalidate book repository cache so the shelf pulls fresh next_book / all records
+    local ok_repo, Repo = pcall(require, "lib/bookshelf_book_repository")
+    if ok_repo and Repo then
+        if Repo.invalidateBookCache then
+            Repo.invalidateBookCache("hybrid-remote-mode")
+        end
+        if Repo.invalidateAllCache then
+            Repo.invalidateAllCache()
+        end
+    end
+
+    -- Refresh live bookshelf widget if visible
+    for _, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
+        local ok, m = pcall(require, mod)
+        local bw = ok and m and m.instance and m.instance.bookshelf
+        if bw then
+            if bw._afterChipEdit then
+                pcall(function() bw:_afterChipEdit() end)
+            elseif bw._selectChip then
+                pcall(function() bw:_selectChip(bw.chip) end)
+            end
+            break
+        end
+    end
+
+    local ok_info, InfoMessage = pcall(require, "ui/widget/infomessage")
+    if ok_info and InfoMessage then
+        local msg = (new_mode == "next_book")
+            and _("Remote Content set to: Next Book")
+            or _("Remote Content set to: All Chapters")
+        UIManager:show(InfoMessage:new{ text = msg, timeout = 2 })
+    end
+end
+
 function M.patchCatalogSettings(Editor)
     if type(Editor) ~= "table" or Editor._hybrid_catalog_patched then return end
     Editor._hybrid_catalog_patched = true
@@ -454,12 +575,8 @@ function M.patchCatalogSettings(Editor)
                 {
                     text = mode_text,
                     callback = function()
-                        if not draft.source then draft.source = {} end
-                        if draft.source.remote_mode == "next_book" then
-                            draft.source.remote_mode = "all"
-                        else
-                            draft.source.remote_mode = "next_book"
-                        end
+                        local new_mode = (draft.source and draft.source.remote_mode == "next_book") and "all" or "next_book"
+                        M.persistRemoteMode(draft, new_mode)
                         if on_close then on_close() end
                         reopen()
                     end,
@@ -510,8 +627,12 @@ function M.patchCatalogSettings(Editor)
 
         buttons[#buttons + 1] = {
             {
-                text = _("Close"),
+                text = _("Save & Close"),
+                is_enter_default = true,
                 callback = function()
+                    if is_hybrid and draft.source and draft.source.remote_mode then
+                        M.persistRemoteMode(draft, draft.source.remote_mode)
+                    end
                     UIManager:close(d)
                     d = nil
                     if on_close then on_close() end
@@ -595,11 +716,8 @@ function M.installEditorPatch()
                             end,
                             callback = function()
                                 local s = draft_found.source or {}
-                                if s.remote_mode == "next_book" then
-                                    s.remote_mode = "all"
-                                else
-                                    s.remote_mode = "next_book"
-                                end
+                                local new_mode = (s.remote_mode == "next_book") and "all" or "next_book"
+                                M.persistRemoteMode(draft_found, new_mode)
                                 if apply_preview_fn then apply_preview_fn(true) end
                                 if rebuild_fn then rebuild_fn() end
                             end,

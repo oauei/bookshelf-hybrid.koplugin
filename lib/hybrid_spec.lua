@@ -521,20 +521,54 @@ local SPEC = {
         local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
         if not (ok_r and Repo and Repo.getAll) then return {}, 0 end
 
-        -- Resolve filter and sort priority from source, falling back to TabModel tab
+        -- Resolve remote_mode, filter, and sort priority from source, falling back to TabModel tab
         local filter = source.filter
         local sort_priority = source.sort_priority
-        if not filter or not sort_priority then
+        if source.remote_mode == nil or not filter or not sort_priority then
             local ok_tm, TabModel = pcall(require, "lib/bookshelf_tab_model")
             if ok_tm and TabModel and TabModel.load then
+                local live_chip = nil
+                for _, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
+                    local ok_m, m = pcall(require, mod)
+                    local bw = ok_m and m and m.instance and m.instance.bookshelf
+                    if bw and bw.chip then live_chip = bw.chip; break end
+                end
+
+                local function same_lib(l1, l2)
+                    if l1 == l2 then return true end
+                    if type(l1) == "table" and type(l2) == "table" then
+                        return l1[1] and l1[1] == l2[1]
+                    end
+                    if type(l1) == "table" and type(l2) == "string" then
+                        return l1[1] == l2
+                    end
+                    if type(l1) == "string" and type(l2) == "table" then
+                        return l1 == l2[1]
+                    end
+                    return false
+                end
+
                 for _, t in ipairs(TabModel.load()) do
-                    if t.source and t.source.kind == "hybrid" and (t.source == source or (source.library_id and t.source.library_id == source.library_id)) then
-                        filter = filter or t.filter
-                        sort_priority = sort_priority or t.sort_priority
-                        if source.remote_mode == nil and t.source.remote_mode ~= nil then
-                            source.remote_mode = t.source.remote_mode
+                    if t.source and t.source.kind == "hybrid" then
+                        local is_match = false
+                        if live_chip and t.id == live_chip then
+                            is_match = true
+                        elseif t.source == source then
+                            is_match = true
+                        elseif source.library_id and t.source.library_id and same_lib(source.library_id, t.source.library_id) then
+                            is_match = true
+                        elseif not source.library_id and not t.source.library_id and t.source.local_folder == source.local_folder then
+                            is_match = true
                         end
-                        break
+
+                        if is_match then
+                            filter = filter or t.filter
+                            sort_priority = sort_priority or t.sort_priority
+                            if source.remote_mode == nil and t.source.remote_mode ~= nil then
+                                source.remote_mode = t.source.remote_mode
+                            end
+                            break
+                        end
                     end
                 end
             end
