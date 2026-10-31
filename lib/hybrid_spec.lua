@@ -86,6 +86,7 @@ local SPEC = {
             draft.source.library_name = prev.library_name
             draft.source.local_folder = prev.local_folder
         end
+        draft.source.remote_mode = prev.remote_mode or "all"
 
         if not draft.label or draft.label == "" or draft.label == _("New shelf") or draft.label == "New chip" then
             draft.label = _("Hybrid")
@@ -364,6 +365,29 @@ local SPEC = {
 
         rows[#rows + 1] = row3
 
+        -- Row 4: Remote Content (All Series & Chapters vs Next Book)
+        rows[#rows + 1] = {
+            {
+                text = function(d)
+                    local s = d.source or {}
+                    if s.remote_mode == "next_book" then
+                        return _("Remote Content: Next Book")
+                    else
+                        return _("Remote Content: All Chapters")
+                    end
+                end,
+                callback = function(d, done)
+                    local s = d.source or {}
+                    if s.remote_mode == "next_book" then
+                        s.remote_mode = "all"
+                    else
+                        s.remote_mode = "next_book"
+                    end
+                    done()
+                end,
+            },
+        }
+
         return rows
     end,
 
@@ -507,6 +531,9 @@ local SPEC = {
                     if t.source and t.source.kind == "hybrid" and (t.source == source or (source.library_id and t.source.library_id == source.library_id)) then
                         filter = filter or t.filter
                         sort_priority = sort_priority or t.sort_priority
+                        if source.remote_mode == nil and t.source.remote_mode ~= nil then
+                            source.remote_mode = t.source.remote_mode
+                        end
                         break
                     end
                 end

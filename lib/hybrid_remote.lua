@@ -635,8 +635,207 @@ function M.scheduleKomgaCovers(records)
     end
 end
 
+function M.getActiveQueue(source)
+    local cached_entry = nil
+    local fetched_at = 0
+    pcall(function()
+        local DataStorage = require("datastorage")
+        local LuaSettings = require("luasettings")
+        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+        if s then
+            local lists = s:readSetting("lists") or {}
+            local e = lists["active_queue"]
+            if e and e.items then
+                cached_entry = e.items
+                fetched_at = tonumber(e.fetched_at) or 0
+            end
+        end
+    end)
+
+    local ttl = 180 -- 3 minutes TTL
+    local is_cache_stale = (not cached_entry) or ((os.time() - fetched_at) > ttl)
+    local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
+    local can_fetch = true
+    if ok_bh and BridgeHealth then
+        if BridgeHealth.isCircuitBreakerActive and BridgeHealth.isCircuitBreakerActive() then
+            can_fetch = false
+        elseif BridgeHealth.isServerReachable and not BridgeHealth.isServerReachable() then
+            can_fetch = false
+        end
+    end
+
+    if is_cache_stale and can_fetch then
+        local komga = getKomgaPlugin()
+        local api = (komga and komga.api) or getKomgaApi()
+        if api then
+            local in_progress = {}
+            local ondeck = {}
+
+            -- 1. In-progress books
+            local ok_ip, resp_ip = pcall(api.get_books, api,
+                { read_status = "IN_PROGRESS", sort = "readProgress.readDate,desc" }, 0, 100)
+            local content_ip = ok_ip and resp_ip and (resp_ip.content or (resp_ip[1] and resp_ip))
+            if content_ip then
+                for _, b in ipairs(content_ip) do
+                    local tb = trimBook(b)
+                    if tb and tb.id and tb.seriesId then
+                        in_progress[#in_progress + 1] = tb
+                    end
+                end
+            end
+
+            -- 2. On Deck books
+            local ok_od, resp_od = pcall(api.get_books_ondeck, api, 0, 100)
+            local content_od = ok_od and resp_od and (resp_od.content or (resp_od[1] and resp_od))
+            if content_od then
+                for _, b in ipairs(content_od) do
+                    local tb = trimBook(b)
+                    if tb and tb.id and tb.seriesId then
+                        ondeck[#ondeck + 1] = tb
+                    end
+                end
+            end
+
+            -- Group by seriesId: in-progress takes precedence over on-deck
+            local series_map = {}
+            local series_order = {}
+
+            for _, b in ipairs(in_progress) do
+                local sid = tostring(b.seriesId)
+                if not series_map[sid] then
+                    series_map[sid] = b
+                    series_order[#series_order + 1] = sid
+                end
+            end
+
+            for _, b in ipairs(ondeck) do
+                local sid = tostring(b.seriesId)
+                if not series_map[sid] then
+                    series_map[sid] = b
+                    series_order[#series_order + 1] = sid
+                end
+            end
+
+            local items = {
+                by_series = series_map,
+                series_order = series_order,
+            }
+
+            cached_entry = items
+            pcall(function()
+                local DataStorage = require("datastorage")
+                local LuaSettings = require("luasettings")
+                local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+                if s then
+                    local lists = s:readSetting("lists") or {}
+                    lists["active_queue"] = { fetched_at = os.time(), items = items }
+                    s:saveSetting("lists", lists)
+                    s:flush()
+                end
+            end)
+        end
+    end
+
+    return cached_entry or { by_series = {}, series_order = {} }
+end
+
+function M.getActiveBookForSeries(source, series_id, series_label)
+    local queue = M.getActiveQueue(source)
+    if not queue or not queue.by_series then return nil end
+
+    if series_id and queue.by_series[tostring(series_id)] then
+        return queue.by_series[tostring(series_id)]
+    end
+
+    if series_label and series_label ~= "" then
+        local label_key = Dedup.nameKey(series_label)
+        if label_key then
+            for sid, book_dto in pairs(queue.by_series) do
+                local title_key = Dedup.nameKey(book_dto.seriesTitle or "")
+                if title_key and Dedup.nameKeysMatch(label_key, title_key) then
+                    return book_dto
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+function M.getActiveSeriesRecords(source)
+    local queue = M.getActiveQueue(source)
+    if not queue or not queue.series_order or #queue.series_order == 0 then
+        return {}, 0
+    end
+
+    local records = {}
+    for _, series_id in ipairs(queue.series_order) do
+        local book_dto = queue.by_series[series_id]
+        if book_dto then
+            local series_title = book_dto.seriesTitle or book_dto.name or series_id
+            local cp = getKomgaCoverPath("series", series_id, series_title)
+            local rec = {
+                id = series_id,
+                komga_series_id = series_id,
+                komga_id = series_id,
+                title = series_title,
+                label = series_title,
+                series_name = series_title,
+                display_title = series_title,
+                kind = "folder",
+                is_folder = true,
+                is_opds_nav = false,
+                source_kind = "hybrid",
+                source_nav = true,
+                path = "komga://series/" .. tostring(series_id),
+                filepath = "komga://series/" .. tostring(series_id),
+                cover_image_path = cp,
+                has_cover = cp ~= nil,
+                first_book = {
+                    filepath = "komga://series/" .. tostring(series_id),
+                    cover_image_path = cp,
+                    title = series_title,
+                    has_cover = cp ~= nil,
+                },
+                active_book = book_dto,
+            }
+            records[#records + 1] = rec
+        end
+    end
+
+    M.scheduleKomgaCovers(records)
+    return records, #records
+end
+
 function M.getKomgaRecords(source, drill)
     ensureKomgaApiPatched()
+
+    -- Next Book mode interception
+    if source and source.remote_mode == "next_book" then
+        if not drill then
+            return M.getActiveSeriesRecords(source)
+        end
+        if drill.kind == "komga_series" or drill.kind == "series" or drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/")) then
+            local series_id = drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:match("^komga://series/(.+)$"))
+            local active_dto = M.getActiveBookForSeries(source, series_id, drill.label)
+            if active_dto then
+                local downloaded = Dedup.getDownloadedMap()
+                local rec = bookDtoToRecord(active_dto, drill.label or active_dto.seriesTitle, drill.series_summary, downloaded)
+                rec.is_remote = not rec.downloaded
+                rec.source_kind = "hybrid"
+                local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title)
+                if cp then
+                    rec.cover_image_path = cp
+                    rec.has_cover = true
+                end
+                rec.label = rec.label or rec.title
+                rec.series_name = rec.series_name or drill.label or active_dto.seriesTitle
+                rec.display_title = rec.display_title or rec.title
+                return { rec }, 1
+            end
+            return {}, 0
+        end
+    end
 
     -- 1. Drilling down into a series/collection
     if drill and (drill.kind == "komga_series" or drill.kind == "series" or drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/"))) then
@@ -818,6 +1017,26 @@ function M.getKomgaFolderRecords(source, folder_path)
         and folder_path:gsub("/+$", ""):match("([^/]+)$") or nil
     local folder_key = Dedup.nameKey(folder_name)
     if not folder_key then return {}, false end
+
+    if source and source.remote_mode == "next_book" then
+        local active_dto = M.getActiveBookForSeries(source, nil, folder_name)
+        if active_dto then
+            local downloaded = Dedup.getDownloadedMap()
+            local rec = bookDtoToRecord(active_dto, folder_name, nil, downloaded)
+            rec.is_remote = not rec.downloaded
+            rec.source_kind = "hybrid"
+            local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title)
+            if cp then
+                rec.cover_image_path = cp
+                rec.has_cover = true
+            end
+            rec.label = rec.label or rec.title
+            rec.series_name = rec.series_name or folder_name
+            rec.display_title = rec.display_title or rec.title
+            return { rec }, 1
+        end
+        return {}, 0
+    end
 
     -- Fetch top level to find matching series
     local series_list = M.getKomgaRecords(source, nil)
