@@ -332,11 +332,9 @@ end
 -- 2. Patch BookshelfChipEditor for Sort Rows, Filters, and Catalog Settings
 -- ---------------------------------------------------------------------------
 
-function M.installEditorPatch()
-    local ok_ed, Editor = pcall(require, "lib/bookshelf_chip_editor")
-    if not (ok_ed and Editor and Editor.editTab) then return end
-    if Editor._hybrid_editor_patched then return end
-    Editor._hybrid_editor_patched = true
+function M.patchCatalogSettings(Editor)
+    if type(Editor) ~= "table" or Editor._hybrid_catalog_patched then return end
+    Editor._hybrid_catalog_patched = true
 
     -- Hook _openCatalogSettings
     local orig_openCatalogSettings = Editor._openCatalogSettings
@@ -446,6 +444,29 @@ function M.installEditorPatch()
             }
         end
 
+        -- 3b. Remote Content Mode (All Chapters vs Next Book)
+        if is_hybrid then
+            local cur_mode = draft.source and draft.source.remote_mode or "all"
+            local mode_text = (cur_mode == "next_book")
+                and _("Remote Content: Next Book")
+                or _("Remote Content: All Chapters")
+            buttons[#buttons + 1] = {
+                {
+                    text = mode_text,
+                    callback = function()
+                        if not draft.source then draft.source = {} end
+                        if draft.source.remote_mode == "next_book" then
+                            draft.source.remote_mode = "all"
+                        else
+                            draft.source.remote_mode = "next_book"
+                        end
+                        if on_close then on_close() end
+                        reopen()
+                    end,
+                },
+            }
+        end
+
         -- 4. Switch network profiles
         local ok_kb, KomgaBridge = pcall(require, "lib/bridge_profiles")
         if not ok_kb then
@@ -505,8 +526,105 @@ function M.installEditorPatch()
         }
         UIManager:show(d)
     end
+    logger.info("[Hybrid] Hooked BookshelfChipEditor._openCatalogSettings")
+end
 
-    logger.info("[Hybrid] Hooked BookshelfChipEditor for catalog settings")
+function M.installEditorPatch()
+    -- 1. Hook ButtonTable.new to inject the Remote Content toggle on the main shelf editor dialog
+    local ok_bt, ButtonTable = pcall(require, "ui/widget/buttontable")
+    if ok_bt and ButtonTable and not ButtonTable._hybrid_editor_hooked then
+        ButtonTable._hybrid_editor_hooked = true
+        local orig_new = ButtonTable.new
+        ButtonTable.new = function(self_bt, o, ...)
+            o = o or {}
+
+            -- Ensure loaded Editor has _openCatalogSettings patched
+            local loaded_ed = package.loaded["lib/bookshelf_chip_editor"]
+            if loaded_ed then M.patchCatalogSettings(loaded_ed) end
+
+            if o.buttons and type(o.buttons) == "table" then
+                local draft_found, apply_preview_fn, rebuild_fn, shelf_row_idx
+                for r_idx, row in ipairs(o.buttons) do
+                    for _, btn in ipairs(row) do
+                        if type(btn) == "table" and type(btn.callback) == "function" then
+                            local cb = btn.callback
+                            for u = 1, 10 do
+                                local un, uv = debug.getupvalue(cb, u)
+                                if not un then break end
+                                if type(uv) == "table" and uv.source and type(uv.source) == "table" and uv.source.kind == "hybrid" then
+                                    draft_found = uv
+                                elseif un == "draft" and type(uv) == "table" then
+                                    draft_found = uv
+                                elseif (un == "applyLivePreview" or un:find("Preview")) and type(uv) == "function" then
+                                    apply_preview_fn = uv
+                                elseif (un == "rebuild" or un:find("rebuild")) and type(uv) == "function" then
+                                    rebuild_fn = uv
+                                end
+                            end
+                            if draft_found then
+                                shelf_row_idx = r_idx
+                                break
+                            end
+                        end
+                    end
+                    if draft_found then break end
+                end
+
+                if draft_found and draft_found.source and draft_found.source.kind == "hybrid" then
+                    local already_has = false
+                    for _, row in ipairs(o.buttons) do
+                        for _, btn in ipairs(row) do
+                            if btn._is_hybrid_remote_mode then
+                                already_has = true
+                                break
+                            end
+                        end
+                        if already_has then break end
+                    end
+
+                    if not already_has then
+                        local remote_btn = {
+                            _is_hybrid_remote_mode = true,
+                            text_func = function()
+                                local s = draft_found.source or {}
+                                if s.remote_mode == "next_book" then
+                                    return _("Remote Content: Next Book")
+                                else
+                                    return _("Remote Content: All Chapters")
+                                end
+                            end,
+                            callback = function()
+                                local s = draft_found.source or {}
+                                if s.remote_mode == "next_book" then
+                                    s.remote_mode = "all"
+                                else
+                                    s.remote_mode = "next_book"
+                                end
+                                if apply_preview_fn then apply_preview_fn(true) end
+                                if rebuild_fn then rebuild_fn() end
+                            end,
+                        }
+                        local insert_pos = (shelf_row_idx and shelf_row_idx + 1) or #o.buttons
+                        table.insert(o.buttons, insert_pos, { remote_btn })
+                    end
+                end
+            end
+            return orig_new(self_bt, o, ...)
+        end
+    end
+
+    -- 2. Patch Editor immediately if already loaded
+    local loaded_ed = package.loaded["lib/bookshelf_chip_editor"]
+    if loaded_ed then
+        M.patchCatalogSettings(loaded_ed)
+    else
+        local ok_ed, Editor = pcall(require, "lib/bookshelf_chip_editor")
+        if ok_ed and Editor then
+            M.patchCatalogSettings(Editor)
+        end
+    end
+
+    logger.info("[Hybrid] Hooked BookshelfChipEditor for catalog settings and shelf editor")
 end
 
 function M.installShelfRowPatch()
