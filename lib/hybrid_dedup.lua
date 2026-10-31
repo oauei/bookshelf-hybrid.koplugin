@@ -308,11 +308,21 @@ function M.mergeRecords(local_records, remote_records)
                     local_folder.display_title = local_folder.display_title or local_folder.title
                     local_folder.komga_series_id = rec.komga_series_id or rec.komga_id or rec.id
                     local_folder.server_key = rec.server_key
-                    if not local_folder.cover_image_path and rec.cover_image_path then
+                    if rec.cover_image_path then
+                        local_folder.cover_image_path = rec.cover_image_path
+                        local_folder.has_cover = true
+                        if local_folder.first_book then
+                            local_folder.first_book.cover_image_path = rec.cover_image_path
+                            local_folder.first_book.has_cover = true
+                        end
+                    elseif not local_folder.cover_image_path and rec.cover_image_path then
                         local_folder.cover_image_path = rec.cover_image_path
                     end
                     if not local_folder.first_book and rec.first_book then
                         local_folder.first_book = rec.first_book
+                    end
+                    if rec.active_book then
+                        local_folder.active_book = rec.active_book
                     end
                 end
             end
@@ -415,7 +425,44 @@ function M.mergeRecords(local_records, remote_records)
             if rec_key then seen_remote[rec_key] = true end
             if kid_str then
                 seen_remote[kid_str] = true
-                seen_remote["komga://book/" .. kid_str] = true
+            end
+        end
+    end
+
+    -- 3. Post-pass: Enrich any local folders or books that didn't match remote records
+    local ok_rem, Remote = pcall(require, "lib/hybrid_remote")
+    for i = 1, #out do
+        local rec = out[i]
+        if rec then
+            if rec.is_folder or rec.kind == "folder" then
+                if not rec.komga_series_id and ok_rem and Remote and Remote.lookupSeriesIdByTitle then
+                    rec.komga_series_id = Remote.lookupSeriesIdByTitle(rec.title or rec.label or rec.series_name)
+                end
+                if not rec.cover_image_path and ok_rem and Remote and Remote.getKomgaCoverPath then
+                    local cp = Remote.getKomgaCoverPath("series", rec.komga_series_id, rec.title or rec.label or rec.series_name)
+                    if not cp and rec.active_book and rec.active_book.id then
+                        cp = Remote.getKomgaCoverPath("book", rec.active_book.id, rec.active_book.name, rec.komga_series_id)
+                    end
+                    if cp then
+                        rec.cover_image_path = cp
+                        rec.has_cover = true
+                        if rec.first_book then
+                            rec.first_book.cover_image_path = cp
+                            rec.first_book.has_cover = true
+                        else
+                            rec.first_book = {
+                                filepath = rec.path or rec.filepath,
+                                cover_image_path = cp,
+                                title = rec.title or rec.label,
+                                has_cover = true,
+                            }
+                        end
+                    end
+                end
+            elseif not rec.is_folder and rec.kind ~= "folder" then
+                if (rec.downloaded or (rec.filepath and not rec.filepath:find("^%a+://"))) and not rec.has_cover then
+                    rec.has_cover = true
+                end
             end
         end
     end

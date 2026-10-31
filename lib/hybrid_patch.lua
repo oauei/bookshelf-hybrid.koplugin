@@ -819,16 +819,30 @@ function M.installShelfRowPatch()
 
                         if ok_r and Remote and Remote.getKomgaCoverPath then
                             if item.is_folder or item.is_opds_nav or item.kind == "opds_nav" or item.kind == "folder" then
-                                local cp = item.cover_image_path or Remote.getKomgaCoverPath("series", item.komga_series_id or item.komga_id, item.title or item.label)
+                                local sid = item.komga_series_id or item.komga_id
+                                if not sid and Remote.lookupSeriesIdByTitle then
+                                    sid = Remote.lookupSeriesIdByTitle(item.title or item.label)
+                                    item.komga_series_id = sid
+                                end
+                                local cp = item.cover_image_path
+                                    or Remote.getKomgaCoverPath("series", sid, item.title or item.label)
+                                    or (item.active_book and Remote.getKomgaCoverPath("book", item.active_book.id, item.active_book.name, sid))
+                                    or (item.first_book and item.first_book.cover_image_path)
+
                                 if cp then
                                     item.cover_image_path = cp
                                     item.has_cover = true
-                                    item.first_book = item.first_book or {
-                                        filepath = item.path or item.filepath,
-                                        cover_image_path = cp,
-                                        title = item.title or item.label,
-                                        has_cover = true,
-                                    }
+                                    if item.first_book then
+                                        item.first_book.cover_image_path = item.first_book.cover_image_path or cp
+                                        item.first_book.has_cover = true
+                                    else
+                                        item.first_book = {
+                                            filepath = item.path or item.filepath,
+                                            cover_image_path = cp,
+                                            title = item.title or item.label,
+                                            has_cover = true,
+                                        }
+                                    end
                                 else
                                     item.first_book = item.first_book or {
                                         filepath = item.path or item.filepath,
@@ -837,9 +851,13 @@ function M.installShelfRowPatch()
                                     }
                                 end
                             else
-                                local cp = item.cover_image_path or Remote.getKomgaCoverPath("book", item.komga_book_id or item.komga_id, item.title)
+                                local cp = item.cover_image_path
+                                    or Remote.getKomgaCoverPath("book", item.komga_book_id or item.komga_id, item.title, item.komga_series_id)
+                                    or (item.komga_series_id and Remote.getKomgaCoverPath("series", item.komga_series_id, item.series_name or item.title))
                                 if cp then
                                     item.cover_image_path = cp
+                                    item.has_cover = true
+                                elseif item.downloaded or (item.filepath and not item.filepath:find("^%a+://")) then
                                     item.has_cover = true
                                 end
                             end

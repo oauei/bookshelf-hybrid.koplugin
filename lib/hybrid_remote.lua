@@ -314,14 +314,63 @@ local function getKomgaApi()
 end
 
 local _cover_path_cache = {}
+local _series_title_to_id = nil
 
 function M.clearCoverPathCache()
     _cover_path_cache = {}
+    _series_title_to_id = nil
 end
 
-function M.getKomgaCoverPath(type_label, id, title)
-    if not (type_label and id) then return nil end
-    local cache_key = tostring(type_label) .. ":" .. tostring(id) .. ":" .. tostring(title or "")
+function M.lookupSeriesIdByTitle(title)
+    if type(title) ~= "string" or title == "" then return nil end
+    local title_key = Dedup.nameKey(title)
+    if not title_key then return nil end
+
+    if not _series_title_to_id then
+        _series_title_to_id = {}
+        pcall(function()
+            local DataStorage = require("datastorage")
+            local LuaSettings = require("luasettings")
+            local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+            if s then
+                local pages = s:readSetting("pages") or {}
+                for _, page in pairs(pages) do
+                    local items = page and page.items
+                    if items then
+                        for _, item in ipairs(items) do
+                            if item.id and item.title then
+                                local k = Dedup.nameKey(item.title)
+                                if k and not _series_title_to_id[k] then
+                                    _series_title_to_id[k] = tostring(item.id)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+    end
+
+    if _series_title_to_id[title_key] then
+        return _series_title_to_id[title_key]
+    end
+
+    local collapsed = title_key:gsub("%s+", "")
+    for k, sid in pairs(_series_title_to_id) do
+        if k:gsub("%s+", "") == collapsed or Dedup.nameKeysMatch(title_key, k) then
+            return sid
+        end
+    end
+    return nil
+end
+
+function M.getKomgaCoverPath(type_label, id, title, fallback_id)
+    if not type_label then return nil end
+    if not id and type_label == "series" and title then
+        id = M.lookupSeriesIdByTitle(title)
+    end
+
+    local cache_key = tostring(type_label) .. ":" .. tostring(id or "") .. ":" .. tostring(title or "") .. ":" .. tostring(fallback_id or "")
     local cached = _cover_path_cache[cache_key]
     if cached ~= nil then
         return cached or nil
@@ -350,32 +399,77 @@ function M.getKomgaCoverPath(type_label, id, title)
     local ok_ds, DataStorage = pcall(require, "datastorage")
     if ok_ds and DataStorage and DataStorage.getDataDir then
         local dd = DataStorage:getDataDir()
-        if dd then addDir(dd .. "/komga_covers") end
+        if dd then
+            addDir(dd .. "/komga_covers")
+            addDir(dd .. "/komga")
+        end
     end
     addDir("/sdcard/koreader/komga_covers")
     addDir("/storage/emulated/0/koreader/komga_covers")
 
     local exts = { ".jpg", ".jpeg", ".png" }
-    for _, d in ipairs(dirs) do
-        for _, ext in ipairs(exts) do
-            local p = d .. "/" .. tostring(type_label) .. "_" .. tostring(id) .. ext
-            if exists(p) then
-                _cover_path_cache[cache_key] = p
-                return p
+
+    -- 1. Check primary cover cache file
+    if id then
+        for _, d in ipairs(dirs) do
+            for _, ext in ipairs(exts) do
+                local p = d .. "/" .. tostring(type_label) .. "_" .. tostring(id) .. ext
+                if exists(p) then
+                    _cover_path_cache[cache_key] = p
+                    return p
+                end
             end
         end
     end
 
-    -- If series title is known, also check local series folder cover
-    if type_label == "series" and type(title) == "string" and title ~= "" then
-        local local_dirs = {
-            "/sdcard/koreader/komga/" .. title .. "/.cover.jpg",
-            "/storage/emulated/0/koreader/komga/" .. title .. "/.cover.jpg",
+    -- 2. If series title is known, check local series folder cover
+    if (type_label == "series" or not id) and type(title) == "string" and title ~= "" then
+        local sanitized = title:gsub("[:?*\"<>/|\\]", "_")
+        local local_roots = {
+            "/sdcard/koreader/komga",
+            "/storage/emulated/0/koreader/komga",
         }
-        for _, lp in ipairs(local_dirs) do
-            if exists(lp) then
-                _cover_path_cache[cache_key] = lp
-                return lp
+        if ok_ds and DataStorage and DataStorage.getDataDir then
+            local dd = DataStorage:getDataDir()
+            if dd then local_roots[#local_roots + 1] = dd .. "/komga" end
+        end
+        for _, root in ipairs(local_roots) do
+            local candidates = {
+                root .. "/" .. title .. "/.cover.jpg",
+                root .. "/" .. sanitized .. "/.cover.jpg",
+            }
+            for _, lp in ipairs(candidates) do
+                if exists(lp) then
+                    _cover_path_cache[cache_key] = lp
+                    return lp
+                end
+            end
+        end
+    end
+
+    -- 3. Fallback checks:
+    -- If series cover was requested, but missing, check fallback_id (active_book id)
+    if type_label == "series" and fallback_id then
+        for _, d in ipairs(dirs) do
+            for _, ext in ipairs(exts) do
+                local p = d .. "/book_" .. tostring(fallback_id) .. ext
+                if exists(p) then
+                    _cover_path_cache[cache_key] = p
+                    return p
+                end
+            end
+        end
+    end
+
+    -- If book cover was requested, but missing, check fallback_id (series id)
+    if type_label == "book" and fallback_id then
+        for _, d in ipairs(dirs) do
+            for _, ext in ipairs(exts) do
+                local p = d .. "/series_" .. tostring(fallback_id) .. ext
+                if exists(p) then
+                    _cover_path_cache[cache_key] = p
+                    return p
+                end
             end
         end
     end
@@ -470,7 +564,7 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
     local media_type = dto.media and dto.media.mediaType
     local fmt = deriveFormat(media_type, dto.name, title)
 
-    local cp = getKomgaCoverPath("book", dto.id, title)
+    local cp = getKomgaCoverPath("book", dto.id, title, dto.seriesId)
 
     return {
         filepath = local_path or rec_key,
@@ -497,7 +591,7 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         last_opened = 0,
         attr = { mode = "file", size = 0, modification = 0 },
         cover_image_path = cp,
-        has_cover = cp ~= nil,
+        has_cover = (cp ~= nil) or (local_path ~= nil),
         downloaded = local_path ~= nil,
         is_remote = local_path == nil,
         is_komga = true,
@@ -602,11 +696,14 @@ function M.scheduleKomgaCovers(records)
 
     local added = 0
     for _, rec in ipairs(records) do
-        if rec and (rec.is_komga or rec.komga_book_id or rec.komga_series_id or rec.komga_dto) then
+        if rec and (rec.is_komga or rec.komga_book_id or rec.komga_series_id or rec.komga_dto or rec.active_book or rec.is_folder or rec.kind == "folder") then
             local is_series = rec.is_folder or rec.is_opds_nav or (rec.komga_series_id ~= nil and rec.komga_book_id == nil)
             local type_label = is_series and "series" or "book"
             local id = is_series and (rec.komga_series_id or (rec.komga_dto and rec.komga_dto.id))
                 or (rec.komga_book_id or (rec.komga_dto and rec.komga_dto.id))
+            if not id and is_series and M.lookupSeriesIdByTitle then
+                id = M.lookupSeriesIdByTitle(rec.title or rec.label or rec.series_name)
+            end
             if id and not getKomgaCoverPath(type_label, id) then
                 local key = type_label .. "_" .. tostring(id)
                 if not _komga_covers_attempted[key] then
@@ -618,7 +715,25 @@ function M.scheduleKomgaCovers(records)
                         lastModified = rec.komga_dto and rec.komga_dto.lastModified,
                     }
                     added = added + 1
-                    if added >= 6 then break end -- limit to at most 6 per page view to prevent backlog
+                    if added >= 6 then break end
+                end
+            end
+            -- Also queue active_book cover if present on series record
+            if rec.active_book and rec.active_book.id and added < 6 then
+                local b_id = rec.active_book.id
+                if not getKomgaCoverPath("book", b_id) then
+                    local key = "book_" .. tostring(b_id)
+                    if not _komga_covers_attempted[key] then
+                        _komga_covers_attempted[key] = true
+                        _komga_covers_queue[#_komga_covers_queue + 1] = {
+                            key = key,
+                            type_label = "book",
+                            id = b_id,
+                            lastModified = rec.active_book.lastModified,
+                        }
+                        added = added + 1
+                        if added >= 6 then break end
+                    end
                 end
             end
         end
@@ -768,12 +883,23 @@ function M.getActiveSeriesRecords(source)
         return {}, 0
     end
 
+    local downloaded = Dedup.getDownloadedMap()
     local records = {}
     for _, series_id in ipairs(queue.series_order) do
         local book_dto = queue.by_series[series_id]
         if book_dto then
             local series_title = book_dto.seriesTitle or book_dto.name or series_id
-            local cp = getKomgaCoverPath("series", series_id, series_title)
+            local cp = getKomgaCoverPath("series", series_id, series_title, book_dto.id)
+            if not cp and book_dto.id then
+                cp = getKomgaCoverPath("book", book_dto.id, book_dto.name, series_id)
+            end
+
+            local kid_str = tostring(book_dto.id)
+            local downloaded_path = (kid_str and (downloaded["komga://book/" .. kid_str] or downloaded[kid_str]))
+
+            local has_cover = (cp ~= nil) or (downloaded_path ~= nil)
+            local filepath = downloaded_path or ("komga://series/" .. tostring(series_id))
+
             local rec = {
                 id = series_id,
                 komga_series_id = series_id,
@@ -788,14 +914,14 @@ function M.getActiveSeriesRecords(source)
                 source_kind = "hybrid",
                 source_nav = true,
                 path = "komga://series/" .. tostring(series_id),
-                filepath = "komga://series/" .. tostring(series_id),
+                filepath = filepath,
                 cover_image_path = cp,
-                has_cover = cp ~= nil,
+                has_cover = has_cover,
                 first_book = {
-                    filepath = "komga://series/" .. tostring(series_id),
+                    filepath = filepath,
                     cover_image_path = cp,
                     title = series_title,
-                    has_cover = cp ~= nil,
+                    has_cover = has_cover,
                 },
                 active_book = book_dto,
             }
@@ -823,17 +949,22 @@ function M.getKomgaRecords(source, drill)
                 local rec = bookDtoToRecord(active_dto, drill.label or active_dto.seriesTitle, drill.series_summary, downloaded)
                 rec.is_remote = not rec.downloaded
                 rec.source_kind = "hybrid"
-                local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title)
+                local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title, series_id)
+                if not cp and series_id then
+                    cp = getKomgaCoverPath("series", series_id, drill.label)
+                end
                 if cp then
                     rec.cover_image_path = cp
+                    rec.has_cover = true
+                elseif rec.downloaded then
                     rec.has_cover = true
                 end
                 rec.label = rec.label or rec.title
                 rec.series_name = rec.series_name or drill.label or active_dto.seriesTitle
                 rec.display_title = rec.display_title or rec.title
+                M.scheduleKomgaCovers({ rec })
                 return { rec }, 1
             end
-            return {}, 0
         end
     end
 
@@ -904,9 +1035,14 @@ function M.getKomgaRecords(source, drill)
                 local rec = bookDtoToRecord(dto, drill.label, drill.series_summary, downloaded)
                 rec.is_remote = not rec.downloaded
                 rec.source_kind = "hybrid"
-                local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title)
+                local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title, series_id)
+                if not cp and series_id then
+                    cp = getKomgaCoverPath("series", series_id, drill.label)
+                end
                 if cp then
                     rec.cover_image_path = cp
+                    rec.has_cover = true
+                elseif rec.downloaded then
                     rec.has_cover = true
                 end
                 rec.label = rec.label or rec.title
@@ -914,6 +1050,7 @@ function M.getKomgaRecords(source, drill)
                 rec.display_title = rec.display_title or rec.title
                 books[#books + 1] = rec
             end
+            M.scheduleKomgaCovers(books)
             return books, #books
         end
     end
@@ -944,13 +1081,19 @@ function M.getKomgaRecords(source, drill)
         -- Query via komga_spec.fetch with limit 1000
         local records, total = komga_spec.fetch(komga_source, drill, 0, 1000)
         records = records or {}
+        local series_id = drill.series_id or drill.komga_series_id
         for i = 1, #records do
             local rec = records[i]
             rec.is_remote = not rec.downloaded
             rec.source_kind = "hybrid"
-            local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title)
+            local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title, series_id)
+            if not cp and series_id then
+                cp = getKomgaCoverPath("series", series_id, drill.label)
+            end
             if cp then
                 rec.cover_image_path = cp
+                rec.has_cover = true
+            elseif rec.downloaded then
                 rec.has_cover = true
             end
             rec.label = rec.label or rec.title
@@ -964,6 +1107,7 @@ function M.getKomgaRecords(source, drill)
                 rec.extension = fmt:lower()
             end
         end
+        M.scheduleKomgaCovers(records)
         return records, total or #records
     end
 
@@ -1025,17 +1169,23 @@ function M.getKomgaFolderRecords(source, folder_path)
             local rec = bookDtoToRecord(active_dto, folder_name, nil, downloaded)
             rec.is_remote = not rec.downloaded
             rec.source_kind = "hybrid"
-            local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title)
+            local sid = rec.komga_dto and rec.komga_dto.seriesId
+            local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title, sid)
+            if not cp and sid then
+                cp = getKomgaCoverPath("series", sid, folder_name)
+            end
             if cp then
                 rec.cover_image_path = cp
+                rec.has_cover = true
+            elseif rec.downloaded then
                 rec.has_cover = true
             end
             rec.label = rec.label or rec.title
             rec.series_name = rec.series_name or folder_name
             rec.display_title = rec.display_title or rec.title
+            M.scheduleKomgaCovers({ rec })
             return { rec }, 1
         end
-        return {}, 0
     end
 
     -- Fetch top level to find matching series
