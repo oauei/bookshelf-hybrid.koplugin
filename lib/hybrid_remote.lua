@@ -251,9 +251,12 @@ local function trimBook(book)
         oneshot = book.oneshot == true,
         lastModified = asString(book.lastModified),
         media = { mediaType = asString(media.mediaType), pagesCount = asNumber(media.pagesCount) },
+        number = asScalar(book.number or md.number),
+        numberSort = asNumber(book.numberSort or md.numberSort),
         metadata = {
             title = asString(md.title),
-            number = asScalar(md.number),
+            number = asScalar(md.number or book.number),
+            numberSort = asNumber(md.numberSort or book.numberSort),
             summary = asString(md.summary),
         },
         authors = authors,
@@ -833,12 +836,21 @@ function M.getActiveQueue(source)
             -- Group by seriesId: in-progress takes precedence over on-deck
             local series_map = {}
             local series_order = {}
+            local series_source = {}
 
             for _, b in ipairs(in_progress) do
                 local sid = tostring(b.seriesId)
                 if not series_map[sid] then
                     series_map[sid] = b
                     series_order[#series_order + 1] = sid
+                    series_source[sid] = "in_progress"
+                else
+                    -- Multiple in-progress books for the same series: pick highest sequence number
+                    local cur_num = Dedup.extractChapterNumber(series_map[sid]) or -1
+                    local new_num = Dedup.extractChapterNumber(b) or -1
+                    if new_num > cur_num then
+                        series_map[sid] = b
+                    end
                 end
             end
 
@@ -847,6 +859,14 @@ function M.getActiveQueue(source)
                 if not series_map[sid] then
                     series_map[sid] = b
                     series_order[#series_order + 1] = sid
+                    series_source[sid] = "ondeck"
+                elseif series_source[sid] == "ondeck" then
+                    -- Multiple on-deck books for the same series: pick highest sequence number
+                    local cur_num = Dedup.extractChapterNumber(series_map[sid]) or -1
+                    local new_num = Dedup.extractChapterNumber(b) or -1
+                    if new_num > cur_num then
+                        series_map[sid] = b
+                    end
                 end
             end
 
@@ -1070,21 +1090,31 @@ function M.expandSeriesToBooks(source, series_entry, sort_priority, local_folder
     -- A. Local member books (if local directory exists)
     local local_books = {}
     local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local function is_dir(p)
+        if not p or type(p) ~= "string" or not p:find("^/") then return false end
+        if ok_lfs and lfs and lfs.attributes then
+            return lfs.attributes(p, "mode") == "directory"
+        end
+        return not p:match("%.%a%w%w?%w?$")
+    end
+
     local folder_path = nil
-    if series_entry.path and type(series_entry.path) == "string" and series_entry.path:find("^/") then
+    if is_dir(series_entry.path) then
         folder_path = series_entry.path
-    elseif series_entry.filepath and type(series_entry.filepath) == "string" and series_entry.filepath:find("^/") then
+    elseif is_dir(series_entry.filepath) then
         folder_path = series_entry.filepath
+    elseif series_entry.filepath and type(series_entry.filepath) == "string" and series_entry.filepath:find("^/") then
+        local parent = series_entry.filepath:match("(.+)/[^/]+$")
+        if is_dir(parent) then folder_path = parent end
     elseif local_folder_path and type(local_folder_path) == "string" and local_folder_path:find("^/") then
         local candidate = local_folder_path:gsub("/+$", "") .. "/" .. series_title
-        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-        if ok_lfs and lfs and lfs.attributes and lfs.attributes(candidate, "mode") == "directory" then
+        if is_dir(candidate) then
             folder_path = candidate
         end
     elseif source and source.local_folder and type(source.local_folder) == "string" then
         local candidate = source.local_folder:gsub("/+$", "") .. "/" .. series_title
-        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-        if ok_lfs and lfs and lfs.attributes and lfs.attributes(candidate, "mode") == "directory" then
+        if is_dir(candidate) then
             folder_path = candidate
         end
     end
@@ -1115,9 +1145,14 @@ function M.expandSeriesToBooks(source, series_entry, sort_priority, local_folder
 
         local merged_books = {}
         if #local_books > 0 and #remote_books > 0 then
-            merged_books = Dedup.mergeRecords(local_books, remote_books)
+            merged_books = Dedup.mergeRecords(local_books, remote_books, active_dto)
         elseif #local_books > 0 then
             merged_books = local_books
+            if active_dto then
+                for _, b in ipairs(merged_books) do
+                    Dedup.syncLocalChapterStatus(b, active_dto)
+                end
+            end
         elseif #remote_books > 0 then
             merged_books = remote_books
         else
@@ -1249,6 +1284,7 @@ function M.getKomgaRecords(source, drill, is_spine)
                 rec.label = rec.label or rec.title
                 rec.series_name = rec.series_name or drill.label or active_dto.seriesTitle
                 rec.display_title = rec.display_title or rec.title
+                rec.active_book = active_dto
                 M.scheduleKomgaCovers({ rec })
                 return { rec }, 1
             else
@@ -1485,6 +1521,7 @@ function M.getKomgaFolderRecords(source, folder_path)
             rec.label = rec.label or rec.title
             rec.series_name = rec.series_name or folder_name
             rec.display_title = rec.display_title or rec.title
+            rec.active_book = active_dto
             M.scheduleKomgaCovers({ rec })
             return { rec }, 1
         else

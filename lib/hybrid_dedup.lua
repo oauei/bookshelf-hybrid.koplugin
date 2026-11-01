@@ -123,6 +123,171 @@ local function checkLocalReadingProgress(filepath)
     return nil, nil
 end
 
+function M.extractChapterNumber(rec)
+    if not rec then return nil end
+
+    if type(rec) == "number" then return rec end
+    if type(rec) == "string" then
+        local n = tonumber(rec)
+        if n then return n end
+    end
+
+    if type(rec) ~= "table" then return nil end
+
+    -- 1. Direct fields
+    local num = tonumber(rec.series_index or rec.series_num or rec.numberSort or rec.number)
+    if num then return num end
+
+    -- 2. Metadata table
+    if type(rec.metadata) == "table" then
+        local m_num = tonumber(rec.metadata.numberSort or rec.metadata.number or rec.metadata.series_index)
+        if m_num then return m_num end
+    end
+
+    -- 3. Komga DTO
+    if type(rec.komga_dto) == "table" then
+        local k_dto = rec.komga_dto
+        local k_num = tonumber(k_dto.numberSort or k_dto.number)
+        if k_num then return k_num end
+        if type(k_dto.metadata) == "table" then
+            k_num = tonumber(k_dto.metadata.numberSort or k_dto.metadata.number)
+            if k_num then return k_num end
+        end
+    end
+
+    -- 4. DocSettings sidecar properties (doc_props or custom_props)
+    local fp = rec.filepath or rec.path
+    if fp and type(fp) == "string" and not fp:find("^%a+://") then
+        local ok_ds, DocSettings = pcall(require, "docsettings")
+        if ok_ds and DocSettings and DocSettings.open then
+            local ok_o, ds = pcall(DocSettings.open, DocSettings, fp)
+            if ok_o and ds and ds.readSetting then
+                local dp = ds:readSetting("doc_props")
+                if type(dp) == "table" then
+                    local s_idx = tonumber(dp.series_index)
+                    if s_idx then return s_idx end
+                end
+                local cp = ds:readSetting("custom_props")
+                if type(cp) == "table" then
+                    local s_idx = tonumber(cp.series_index)
+                    if s_idx then return s_idx end
+                end
+            end
+        end
+    end
+
+    -- 5. Filename / Title pattern parsing
+    local str = rec.title or rec.display_title or rec.filename or rec.name
+    if type(str) ~= "string" and fp and type(fp) == "string" then
+        str = fp:match("([^/]+)$")
+    end
+    if type(str) == "string" then
+        -- Remove extension (.cbz, .cbr, .epub, .pdf, etc.)
+        str = str:gsub("%.%a%w%w?%w?$", "")
+
+        -- Chapter markers: "Chapter 3", "ch. 03", "c3.5", "Ch3", "ch 3"
+        local ch_str = str:match("[Cc]h[%a]*[%s_%.%-]*([%d]+%.?[%d]*)")
+        if ch_str then
+            local n = tonumber(ch_str)
+            if n then return n end
+        end
+
+        -- Hash marker: "#03", "# 3"
+        local hash_str = str:match("[#＃][%s_]*([%d]+%.?[%d]*)")
+        if hash_str then
+            local n = tonumber(hash_str)
+            if n then return n end
+        end
+
+        -- Volume and chapter: "v01 c03", "v1 - 03", "Vol 1 Ch 3"
+        local vol_ch_str = str:match("[Vv]ol?%d+[%s_%.%-]+[Cc]?(%d+%.?%d*)")
+        if vol_ch_str then
+            local n = tonumber(vol_ch_str)
+            if n then return n end
+        end
+
+        -- " - 03", " - 3.5" (standard "Series - 03")
+        local dash_num = str:match("%s+%-%s+([%d]+%.?[%d]*)")
+        if dash_num then
+            local n = tonumber(dash_num)
+            if n then return n end
+        end
+
+        -- Trailing number: "Series Name 03", "Series 3"
+        local trailing_num = str:match("[%s_]+([%d]+%.?[%d]*)%s*$")
+        if trailing_num then
+            local n = tonumber(trailing_num)
+            if n then return n end
+        end
+
+        -- Leading number: "03 - Series", "03.cbz"
+        local leading_num = str:match("^([%d]+%.?[%d]*)[%s_%.%-]+")
+        if leading_num then
+            local n = tonumber(leading_num)
+            if n then return n end
+        end
+
+        -- Exact number only: "03"
+        local exact_num = str:match("^([%d]+%.?[%d]*)$")
+        if exact_num then
+            local n = tonumber(exact_num)
+            if n then return n end
+        end
+    end
+
+    return nil
+end
+
+function M.syncLocalChapterStatus(local_rec, frontier_dto)
+    if not local_rec or not frontier_dto then return false end
+    local frontier_num = M.extractChapterNumber(frontier_dto)
+    local local_num = M.extractChapterNumber(local_rec)
+
+    if not frontier_num or not local_num then return false end
+    if local_num >= frontier_num then return false end
+
+    -- Local chapter is older than the active reading frontier:
+    -- Update in-memory record to finished (1.0)
+    local_rec.status = "finished"
+    local_rec._status = "finished"
+    local_rec.read_status = "finished"
+    local_rec.percent_finished = 1.0
+    local_rec.book_pct = 1.0
+    local_rec.is_completed = true
+
+    -- Update .sdr sidecar on disk if local file exists
+    local filepath = local_rec.filepath or local_rec.path
+    if filepath and type(filepath) == "string" and not filepath:find("^%a+://") then
+        local ok_ds, DocSettings = pcall(require, "docsettings")
+        if ok_ds and DocSettings and DocSettings.open then
+            local ok_o, ds = pcall(DocSettings.open, DocSettings, filepath)
+            if ok_o and ds and ds.readSetting then
+                local summary = ds:readSetting("summary")
+                if type(summary) ~= "table" then summary = {} end
+                local current_pct = tonumber(ds:readSetting("percent_finished")) or 0
+                if summary.status ~= "complete" or current_pct < 1.0 then
+                    summary.status = "complete"
+                    summary.modified = os.date("%Y-%m-%d")
+                    if ds.saveSetting then
+                        ds:saveSetting("summary", summary)
+                        ds:saveSetting("percent_finished", 1.0)
+                    end
+                    if ds.flush then pcall(ds.flush, ds) end
+                end
+            end
+        end
+
+        -- Update BookList cache if available
+        local ok_bl, BookList = pcall(require, "apps/filemanager/booklist")
+        if ok_bl and BookList and BookList.setBookInfoCacheProperty then
+            pcall(BookList.setBookInfoCacheProperty, BookList, filepath, "status", "complete")
+            pcall(BookList.setBookInfoCacheProperty, BookList, filepath, "percent_finished", 1.0)
+        end
+    end
+
+    return true
+end
+
 function M.getDownloadedMap()
     local downloaded = {}
 
@@ -190,7 +355,7 @@ function M.getDownloadedMap()
     return downloaded
 end
 
-function M.mergeRecords(local_records, remote_records)
+function M.mergeRecords(local_records, remote_records, frontier_dto)
     local downloaded = M.getDownloadedMap()
     local out = {}
 
@@ -374,14 +539,43 @@ function M.mergeRecords(local_records, remote_records)
                             local_book.cover_image_path = rec.cover_image_path
                             local_book.has_cover = true
                         end
-                        -- If remote shows finished and local was unread, accept remote finished
-                        if (rec.status == "finished" or rec.read_status == "finished" or rec.percent_finished == 1)
-                            and (not local_book.percent_finished or local_book.percent_finished == 0) then
+                        -- If remote shows finished, mark local as finished and sync .sdr sidecar
+                        local remote_finished = (rec.status == "finished" or rec.read_status == "finished" or rec.percent_finished == 1.0
+                            or (rec.komga_dto and rec.komga_dto.readProgress and rec.komga_dto.readProgress.completed))
+                        if remote_finished then
                             local_book.status = "finished"
                             local_book._status = "finished"
                             local_book.read_status = "finished"
                             local_book.percent_finished = 1.0
                             local_book.book_pct = 1.0
+                            local_book.is_completed = true
+
+                            local fp = local_book.filepath or local_book.path
+                            if fp and type(fp) == "string" and not fp:find("^%a+://") then
+                                local ok_ds, DocSettings = pcall(require, "docsettings")
+                                if ok_ds and DocSettings and DocSettings.open then
+                                    local ok_o, ds = pcall(DocSettings.open, DocSettings, fp)
+                                    if ok_o and ds and ds.readSetting then
+                                        local summary = ds:readSetting("summary")
+                                        if type(summary) ~= "table" then summary = {} end
+                                        local current_pct = tonumber(ds:readSetting("percent_finished")) or 0
+                                        if summary.status ~= "complete" or current_pct < 1.0 then
+                                            summary.status = "complete"
+                                            summary.modified = os.date("%Y-%m-%d")
+                                            if ds.saveSetting then
+                                                ds:saveSetting("summary", summary)
+                                                ds:saveSetting("percent_finished", 1.0)
+                                            end
+                                            if ds.flush then pcall(ds.flush, ds) end
+                                        end
+                                    end
+                                end
+                                local ok_bl, BookList = pcall(require, "apps/filemanager/booklist")
+                                if ok_bl and BookList and BookList.setBookInfoCacheProperty then
+                                    pcall(BookList.setBookInfoCacheProperty, BookList, fp, "status", "complete")
+                                    pcall(BookList.setBookInfoCacheProperty, BookList, fp, "percent_finished", 1.0)
+                                end
+                            end
                         end
                     end
                 end
@@ -423,6 +617,45 @@ function M.mergeRecords(local_records, remote_records)
             if rec_key then seen_remote[rec_key] = true end
             if kid_str then
                 seen_remote[kid_str] = true
+            end
+        end
+    end
+
+    -- Read-Ahead Status Alignment against frontier DTO
+    local active_frontier = frontier_dto
+    if not active_frontier and remote_records and #remote_records > 0 then
+        if remote_records[1] and remote_records[1].active_book then
+            active_frontier = remote_records[1].active_book
+        elseif #remote_records == 1 and not (remote_records[1].is_folder or remote_records[1].kind == "folder") then
+            active_frontier = remote_records[1]
+        elseif #remote_records > 1 then
+            local highest_in_progress = nil
+            local highest_ip_num = -1
+            for _, r in ipairs(remote_records) do
+                if not (r.is_folder or r.kind == "folder") then
+                    local is_reading = (r.status == "reading" or r.read_status == "reading")
+                        or (r.percent_finished and r.percent_finished > 0 and r.percent_finished < 1)
+                        or (r.komga_dto and r.komga_dto.readProgress and not r.komga_dto.readProgress.completed and (r.komga_dto.readProgress.page or 0) > 0)
+                    if is_reading then
+                        local n = M.extractChapterNumber(r) or -1
+                        if n > highest_ip_num then
+                            highest_ip_num = n
+                            highest_in_progress = r
+                        end
+                    end
+                end
+            end
+            if highest_in_progress then
+                active_frontier = highest_in_progress
+            end
+        end
+    end
+
+    if active_frontier then
+        for i = 1, #out do
+            local item = out[i]
+            if item and not (item.is_folder or item.kind == "folder" or item.is_series) then
+                M.syncLocalChapterStatus(item, active_frontier)
             end
         end
     end
