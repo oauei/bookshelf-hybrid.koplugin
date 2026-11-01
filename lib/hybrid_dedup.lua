@@ -308,15 +308,13 @@ function M.mergeRecords(local_records, remote_records)
                     local_folder.display_title = local_folder.display_title or local_folder.title
                     local_folder.komga_series_id = rec.komga_series_id or rec.komga_id or rec.id
                     local_folder.server_key = rec.server_key
-                    if rec.cover_image_path then
+                    if not local_folder.cover_image_path and rec.cover_image_path then
                         local_folder.cover_image_path = rec.cover_image_path
                         local_folder.has_cover = true
                         if local_folder.first_book then
                             local_folder.first_book.cover_image_path = rec.cover_image_path
                             local_folder.first_book.has_cover = true
                         end
-                    elseif not local_folder.cover_image_path and rec.cover_image_path then
-                        local_folder.cover_image_path = rec.cover_image_path
                     end
                     if not local_folder.first_book and rec.first_book then
                         local_folder.first_book = rec.first_book
@@ -464,6 +462,18 @@ function M.mergeRecords(local_records, remote_records)
                     rec.has_cover = true
                 end
             end
+        end
+    end
+
+    for i = 1, #out do
+        local rec = out[i]
+        if not rec.page_count or rec.page_count <= 0 then
+            rec.page_count = (rec.komga_dto and rec.komga_dto.media and rec.komga_dto.media.pagesCount and rec.komga_dto.media.pagesCount > 0 and rec.komga_dto.media.pagesCount)
+                or (rec.active_book and rec.active_book.media and rec.active_book.media.pagesCount and rec.active_book.media.pagesCount > 0 and rec.active_book.media.pagesCount)
+                or 200
+        end
+        if rec.first_book and (not rec.first_book.page_count or rec.first_book.page_count <= 0) then
+            rec.first_book.page_count = rec.page_count
         end
     end
 

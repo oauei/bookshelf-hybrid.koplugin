@@ -548,6 +548,24 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         end
     end
 
+    local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+    if ok_sq and SyncQueue and SyncQueue.getQueue then
+        local q = SyncQueue.getQueue()
+        local queued = q[id_str]
+        if queued then
+            if queued.action == "delete" then
+                status = "unread"
+                pct = 0
+            elseif queued.completed then
+                status = "finished"
+                pct = 1.0
+            elseif queued.page and dto.media and dto.media.pagesCount and dto.media.pagesCount > 0 then
+                status = "reading"
+                pct = math.min(queued.page / dto.media.pagesCount, 0.99)
+            end
+        end
+    end
+
     local authors_arr = {}
     if dto.authors then
         for _, a in ipairs(dto.authors) do
@@ -600,6 +618,7 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         komga_book_id = dto.id,
         komga_id = dto.id,
         komga_dto = dto,
+        page_count = (dto.media and dto.media.pagesCount and dto.media.pagesCount > 0 and dto.media.pagesCount) or 200,
     }
 end
 
@@ -877,7 +896,7 @@ function M.getActiveBookForSeries(source, series_id, series_label)
     return nil
 end
 
-function M.getActiveSeriesRecords(source)
+function M.getActiveSeriesRecords(source, is_spine)
     local queue = M.getActiveQueue(source)
     if not queue or not queue.series_order or #queue.series_order == 0 then
         return {}, 0
@@ -897,35 +916,53 @@ function M.getActiveSeriesRecords(source)
             local kid_str = tostring(book_dto.id)
             local downloaded_path = (kid_str and (downloaded["komga://book/" .. kid_str] or downloaded[kid_str]))
 
-            local has_cover = (cp ~= nil) or (downloaded_path ~= nil)
-            local filepath = downloaded_path or ("komga://series/" .. tostring(series_id))
+            if is_spine then
+                local rec = bookDtoToRecord(book_dto, series_title, nil, downloaded)
+                rec.shelf_section = series_title
+                rec.shelf_section_path = "komga://series/" .. tostring(series_id)
+                rec.series_name = series_title
+                rec.is_folder = false
+                rec.is_series = false
+                rec.kind = "book"
+                rec.source_kind = "hybrid"
+                rec.is_remote = not rec.downloaded
+                rec.active_book = book_dto
+                rec.page_count = (book_dto.media and book_dto.media.pagesCount and book_dto.media.pagesCount > 0 and book_dto.media.pagesCount) or 200
+                records[#records + 1] = rec
+            else
+                local has_cover = (cp ~= nil) or (downloaded_path ~= nil)
+                local filepath = downloaded_path or ("komga://series/" .. tostring(series_id))
 
-            local rec = {
-                id = series_id,
-                komga_series_id = series_id,
-                komga_id = series_id,
-                title = series_title,
-                label = series_title,
-                series_name = series_title,
-                display_title = series_title,
-                kind = "folder",
-                is_folder = true,
-                is_opds_nav = false,
-                source_kind = "hybrid",
-                source_nav = true,
-                path = "komga://series/" .. tostring(series_id),
-                filepath = filepath,
-                cover_image_path = cp,
-                has_cover = has_cover,
-                first_book = {
+                local rec = {
+                    id = series_id,
+                    komga_series_id = series_id,
+                    komga_id = series_id,
+                    title = series_title,
+                    label = series_title,
+                    series_name = series_title,
+                    display_title = series_title,
+                    kind = "folder",
+                    is_folder = true,
+                    is_opds_nav = false,
+                    source_kind = "hybrid",
+                    source_nav = true,
+                    path = "komga://series/" .. tostring(series_id),
                     filepath = filepath,
                     cover_image_path = cp,
-                    title = series_title,
                     has_cover = has_cover,
-                },
-                active_book = book_dto,
-            }
-            records[#records + 1] = rec
+                    page_count = (book_dto and book_dto.media and book_dto.media.pagesCount and book_dto.media.pagesCount > 0 and book_dto.media.pagesCount) or 200,
+                    is_series = true,
+                    first_book = {
+                        filepath = filepath,
+                        cover_image_path = cp,
+                        title = series_title,
+                        has_cover = has_cover,
+                        page_count = (book_dto and book_dto.media and book_dto.media.pagesCount and book_dto.media.pagesCount > 0 and book_dto.media.pagesCount) or 200,
+                    },
+                    active_book = book_dto,
+                }
+                records[#records + 1] = rec
+            end
         end
     end
 
@@ -933,13 +970,263 @@ function M.getActiveSeriesRecords(source)
     return records, #records
 end
 
-function M.getKomgaRecords(source, drill)
+function M.getKomgaSeriesBooks(series_id, series_title, series_summary)
+    if not series_id then return {} end
+    local cached_items = nil
+    local fetched_at = 0
+    pcall(function()
+        local DataStorage = require("datastorage")
+        local LuaSettings = require("luasettings")
+        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+        if s then
+            local entries = s:readSetting("series") or {}
+            local e = entries[series_id]
+            if e and e.items and #e.items > 0 then
+                cached_items = e.items
+                fetched_at = tonumber(e.fetched_at) or 0
+            end
+        end
+    end)
+
+    local ttl = 180 -- 3 minutes TTL
+    local is_cache_stale = (not cached_items or #cached_items == 0) or ((os.time() - fetched_at) > ttl)
+    local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
+    local can_fetch = true
+    if ok_bh and BridgeHealth then
+        if BridgeHealth.isCircuitBreakerActive and BridgeHealth.isCircuitBreakerActive() then
+            can_fetch = false
+        elseif BridgeHealth.isServerReachable and not BridgeHealth.isServerReachable() then
+            can_fetch = false
+        end
+    end
+
+    if is_cache_stale and can_fetch then
+        local komga = getKomgaPlugin()
+        local api = (komga and komga.api) or getKomgaApi()
+        if api then
+            local ok_res, resp = pcall(api.get_books_for_series, api, series_id,
+                { sort = "metadata.numberSort,asc" }, 0, 1000)
+            if not ok_res or not resp then
+                ok_res, resp = pcall(api.get_books_for_series, api, series_id, nil, 0, 1000)
+            end
+            local content = resp and (resp.content or (resp[1] and resp))
+            if content and #content > 0 then
+                cached_items = trimBooks(content, 1000)
+                pcall(function()
+                    local DataStorage = require("datastorage")
+                    local LuaSettings = require("luasettings")
+                    local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+                    if s then
+                        local entries = s:readSetting("series") or {}
+                        entries[series_id] = { fetched_at = os.time(), items = cached_items }
+                        s:saveSetting("series", entries)
+                        s:flush()
+                    end
+                end)
+            end
+        end
+    end
+
+    if not cached_items or #cached_items == 0 then
+        return {}
+    end
+
+    local downloaded = Dedup.getDownloadedMap()
+    local books = {}
+    for _, dto in ipairs(cached_items) do
+        local rec = bookDtoToRecord(dto, series_title, series_summary, downloaded)
+        rec.is_remote = not rec.downloaded
+        rec.source_kind = "hybrid"
+        local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title, series_id)
+        if not cp and series_id then
+            cp = getKomgaCoverPath("series", series_id, series_title)
+        end
+        if cp then
+            rec.cover_image_path = cp
+            rec.has_cover = true
+        elseif rec.downloaded then
+            rec.has_cover = true
+        end
+        rec.label = rec.label or rec.title
+        rec.series_name = rec.series_name or series_title
+        rec.display_title = rec.display_title or rec.title
+        rec.page_count = (dto.media and dto.media.pagesCount and dto.media.pagesCount > 0 and dto.media.pagesCount) or 200
+        books[#books + 1] = rec
+    end
+    M.scheduleKomgaCovers(books)
+    return books
+end
+
+function M.expandSeriesToBooks(source, series_entry, sort_priority, local_folder_path)
+    local series_title = series_entry.title or series_entry.label or series_entry.series_name or "Unknown Series"
+    local series_id = series_entry.komga_series_id or series_entry.id
+    if not series_id and type(series_entry.path) == "string" then
+        series_id = series_entry.path:match("^komga://series/(.+)$")
+    end
+    if not series_id and type(series_entry.filepath) == "string" then
+        series_id = series_entry.filepath:match("^komga://series/(.+)$")
+    end
+
+    -- A. Local member books (if local directory exists)
+    local local_books = {}
+    local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
+    local folder_path = nil
+    if series_entry.path and type(series_entry.path) == "string" and series_entry.path:find("^/") then
+        folder_path = series_entry.path
+    elseif series_entry.filepath and type(series_entry.filepath) == "string" and series_entry.filepath:find("^/") then
+        folder_path = series_entry.filepath
+    elseif local_folder_path and type(local_folder_path) == "string" and local_folder_path:find("^/") then
+        local candidate = local_folder_path:gsub("/+$", "") .. "/" .. series_title
+        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+        if ok_lfs and lfs and lfs.attributes and lfs.attributes(candidate, "mode") == "directory" then
+            folder_path = candidate
+        end
+    elseif source and source.local_folder and type(source.local_folder) == "string" then
+        local candidate = source.local_folder:gsub("/+$", "") .. "/" .. series_title
+        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+        if ok_lfs and lfs and lfs.attributes and lfs.attributes(candidate, "mode") == "directory" then
+            folder_path = candidate
+        end
+    end
+
+    if folder_path and ok_r and Repo and Repo.getAll then
+        local_books = Repo.getAll(folder_path, 10000, 0, sort_priority, nil) or {}
+    end
+
+    -- 1. Check if Next Book mode:
+    if source and source.remote_mode == "next_book" then
+        local active_dto = series_entry.active_book
+        if not active_dto and series_id then
+            active_dto = M.getActiveBookForSeries(source, series_id, series_title)
+        end
+        if not active_dto and series_title then
+            active_dto = M.getActiveBookForSeries(source, nil, series_title)
+        end
+
+        local remote_books = {}
+        if active_dto then
+            local downloaded = Dedup.getDownloadedMap()
+            local rec = bookDtoToRecord(active_dto, series_title, nil, downloaded)
+            rec.is_remote = not rec.downloaded
+            rec.source_kind = "hybrid"
+            rec.page_count = (active_dto.media and active_dto.media.pagesCount and active_dto.media.pagesCount > 0 and active_dto.media.pagesCount) or 200
+            remote_books = { rec }
+        end
+
+        local merged_books = {}
+        if #local_books > 0 and #remote_books > 0 then
+            merged_books = Dedup.mergeRecords(local_books, remote_books)
+        elseif #local_books > 0 then
+            merged_books = local_books
+        elseif #remote_books > 0 then
+            merged_books = remote_books
+        else
+            return {}
+        end
+
+        for i = 1, #merged_books do
+            local b = merged_books[i]
+            b.shelf_section = series_title
+            b.shelf_section_path = folder_path or series_entry.path or series_entry.filepath or ("komga://series/" .. tostring(series_id or ""))
+            b.series_name = b.series_name or series_title
+            b.filepath = b.filepath or b.path or b.fp or b.shelf_section_path
+            b.is_folder = false
+            b.is_series = false
+            b.kind = "book"
+            b.source_kind = "hybrid"
+            if b.is_remote == nil then
+                b.is_remote = (type(b.filepath) == "string" and b.filepath:find("^%a+://") ~= nil)
+            end
+            b.page_count = (b.page_count and b.page_count > 0 and b.page_count) or 200
+        end
+
+        return merged_books
+    end
+
+    -- 2. All Chapters mode:
+
+    -- B. Remote member books
+    local remote_books = {}
+    if series_id then
+        remote_books = M.getKomgaSeriesBooks(series_id, series_title, series_entry.series_summary) or {}
+    end
+
+    -- C. Deduplicate
+    local merged_books = {}
+    if #local_books > 0 and #remote_books > 0 then
+        merged_books = Dedup.mergeRecords(local_books, remote_books)
+    elseif #local_books > 0 then
+        merged_books = local_books
+    elseif #remote_books > 0 then
+        merged_books = remote_books
+    end
+
+    -- Fallback if neither local nor remote books were loaded (e.g. offline/uncached)
+    if #merged_books == 0 then
+        if series_entry.active_book then
+            local downloaded = Dedup.getDownloadedMap()
+            merged_books = { bookDtoToRecord(series_entry.active_book, series_title, nil, downloaded) }
+        elseif series_entry.first_book then
+            local fb = series_entry.first_book
+            local fp = fb.filepath or fb.path or fb.fp or (folder_path and (folder_path .. "/cover.jpg")) or ("komga://series/" .. tostring(series_id or ""))
+            merged_books = {
+                {
+                    filepath = fp,
+                    title = fb.title or series_title,
+                    display_title = fb.title or series_title,
+                    series_name = series_title,
+                    cover_image_path = fb.cover_image_path,
+                    has_cover = fb.has_cover,
+                    page_count = fb.page_count or 200,
+                    kind = "book",
+                    source_kind = "hybrid",
+                }
+            }
+        else
+            local fp = (folder_path and (folder_path .. "/cover.jpg")) or ("komga://series/" .. tostring(series_id or ""))
+            merged_books = {
+                {
+                    filepath = fp,
+                    title = series_title,
+                    display_title = series_title,
+                    series_name = series_title,
+                    cover_image_path = series_entry.cover_image_path,
+                    has_cover = series_entry.has_cover,
+                    page_count = series_entry.page_count or 200,
+                    kind = "book",
+                    source_kind = "hybrid",
+                }
+            }
+        end
+    end
+
+    -- Tag every book with section metadata and guarantee filepath
+    for i = 1, #merged_books do
+        local b = merged_books[i]
+        b.shelf_section = series_title
+        b.shelf_section_path = folder_path or series_entry.path or series_entry.filepath or ("komga://series/" .. tostring(series_id or ""))
+        b.series_name = b.series_name or series_title
+        b.filepath = b.filepath or b.path or b.fp or b.shelf_section_path
+        b.is_folder = false
+        b.is_series = false
+        b.kind = "book"
+        b.source_kind = "hybrid"
+        if b.is_remote == nil then
+            b.is_remote = (type(b.filepath) == "string" and b.filepath:find("^%a+://") ~= nil)
+        end
+        b.page_count = (b.page_count and b.page_count > 0 and b.page_count) or 200
+    end
+
+    return merged_books
+end
+
+function M.getKomgaRecords(source, drill, is_spine)
     ensureKomgaApiPatched()
 
     -- Next Book mode interception
     if source and source.remote_mode == "next_book" then
         if not drill then
-            return M.getActiveSeriesRecords(source)
+            return M.getActiveSeriesRecords(source, false)
         end
         if drill.kind == "komga_series" or drill.kind == "series" or drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/")) then
             local series_id = drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:match("^komga://series/(.+)$"))
@@ -964,6 +1251,8 @@ function M.getKomgaRecords(source, drill)
                 rec.display_title = rec.display_title or rec.title
                 M.scheduleKomgaCovers({ rec })
                 return { rec }, 1
+            else
+                return {}, 0
             end
         end
     end
@@ -1061,6 +1350,15 @@ function M.getKomgaRecords(source, drill)
         return {}, 0
     end
 
+    local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+    if ok_sq and SyncQueue and SyncQueue.hasPending and SyncQueue.hasPending() then
+        local komga = getKomgaPlugin()
+        local api = (komga and komga.api) or getKomgaApi()
+        if api then
+            SyncQueue.flush(api)
+        end
+    end
+
     local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
     if not (ok_s and Sources and Sources.get) then return {}, 0 end
 
@@ -1134,6 +1432,8 @@ function M.getKomgaRecords(source, drill)
             r.komga_series_id = r.komga_series_id or (type(r.filepath) == "string" and r.filepath:match("^komga://series/(.+)$"))
             r.path = r.filepath or ("komga://series/" .. tostring(r.komga_series_id))
             local cp = r.cover_image_path or getKomgaCoverPath("series", r.komga_series_id or r.komga_id, r.title or r.label)
+            r.is_series = true
+            r.page_count = r.page_count or 200
             if cp then
                 r.cover_image_path = cp
                 r.has_cover = true
@@ -1142,12 +1442,14 @@ function M.getKomgaRecords(source, drill)
                     cover_image_path = cp,
                     title = r.title or r.label,
                     has_cover = true,
+                    page_count = r.page_count or 200,
                 }
             else
                 r.first_book = r.first_book or {
                     filepath = r.path,
                     title = r.title or r.label,
                     has_cover = false,
+                    page_count = r.page_count or 200,
                 }
             end
         end
@@ -1185,6 +1487,8 @@ function M.getKomgaFolderRecords(source, folder_path)
             rec.display_title = rec.display_title or rec.title
             M.scheduleKomgaCovers({ rec })
             return { rec }, 1
+        else
+            return {}, 0
         end
     end
 
@@ -1284,7 +1588,7 @@ end
 -- Unified Remote Resolver
 -- ---------------------------------------------------------------------------
 
-function M.fetchRemote(source, folder_path, drill)
+function M.fetchRemote(source, folder_path, drill, is_spine)
     -- 1. If drilling into an OPDS series or subcatalog feed
     if drill and (drill.kind == "opds_nav" or drill.feed_url) then
         return M.getOpdsDrillRecords(source, drill)
@@ -1292,7 +1596,7 @@ function M.fetchRemote(source, folder_path, drill)
 
     -- 2. If drilling into a Komga series
     if drill and (drill.kind == "komga_series" or drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/"))) then
-        return M.getKomgaRecords(source, drill)
+        return M.getKomgaRecords(source, drill, is_spine)
     end
 
     -- 3. If drilling into a local filesystem folder on a hybrid shelf
@@ -1310,7 +1614,7 @@ function M.fetchRemote(source, folder_path, drill)
     if remote_kind == "opds" then
         return M.getOpdsRecords(source)
     else
-        return M.getKomgaRecords(source, nil)
+        return M.getKomgaRecords(source, nil, false)
     end
 end
 
@@ -1639,19 +1943,58 @@ end
 
 function M.setKomgaReadProgress(book_id, completed)
     if not book_id then return false end
+
+    local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+    local ok_h, Health = pcall(require, "lib/bridge_health")
+    local reachable = true
+    if ok_h and Health and Health.isServerReachable then
+        reachable = Health.isServerReachable()
+    end
+
+    if not reachable then
+        if ok_sq and SyncQueue and SyncQueue.enqueue then
+            SyncQueue.enqueue(completed and "progress" or "delete", book_id, { completed = completed })
+        end
+        return false, "offline"
+    end
+
     local komga = getKomgaPlugin()
     local api = (komga and komga.api) or getKomgaApi()
-    if not api then return false end
+    if not api then
+        if ok_sq and SyncQueue and SyncQueue.enqueue then
+            SyncQueue.enqueue(completed and "progress" or "delete", book_id, { completed = completed })
+        end
+        return false, "no_api"
+    end
 
+    local success, err, is_unreachable
     if completed then
         if api.patch_read_progress then
-            return pcall(api.patch_read_progress, api, book_id, nil, true)
+            success, err, is_unreachable = api:patch_read_progress(book_id, nil, true)
         else
-            return pcall(api.request, api, "/api/v1/books/" .. tostring(book_id) .. "/read-progress", "PATCH", { completed = true })
+            success, err, is_unreachable = api:request("/api/v1/books/" .. tostring(book_id) .. "/read-progress", "PATCH", { completed = true })
         end
     else
-        return pcall(api.request, api, "/api/v1/books/" .. tostring(book_id) .. "/read-progress", "DELETE")
+        success, err, is_unreachable = api:request("/api/v1/books/" .. tostring(book_id) .. "/read-progress", "DELETE")
     end
+
+    if not success then
+        local err_str = tostring(err):lower()
+        if is_unreachable or err_str:find("timeout") or err_str:find("unreachable") or err_str:find("refused") then
+            if ok_sq and SyncQueue and SyncQueue.enqueue then
+                SyncQueue.enqueue(completed and "progress" or "delete", book_id, { completed = completed })
+            end
+            if ok_h and Health and Health.tripCircuitBreaker then
+                Health.tripCircuitBreaker(err)
+            end
+        end
+        return false, err
+    end
+
+    if ok_sq and SyncQueue and SyncQueue.remove then
+        SyncQueue.remove(book_id)
+    end
+    return true
 end
 
 M.bookDtoToRecord = bookDtoToRecord

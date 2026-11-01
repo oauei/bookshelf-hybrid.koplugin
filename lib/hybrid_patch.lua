@@ -325,7 +325,73 @@ function M.installWidgetPatch()
         return false
     end
 
-    logger.info("[Hybrid] Hooked BookshelfWidget start feed and effective tab methods")
+    -- Hook _viewMode to preserve ViewMode.SPINES for hybrid, komga, and opds
+    local orig_viewMode = BookshelfWidget._viewMode
+    BookshelfWidget._viewMode = function(self_w)
+        local ok_vm, ViewMode = pcall(require, "lib/bookshelf_view_mode")
+        if not (ok_vm and ViewMode) then
+            return orig_viewMode and orig_viewMode(self_w)
+        end
+        local ok_tm, TabModel = pcall(require, "lib/bookshelf_tab_model")
+        local tab = ok_tm and TabModel and TabModel.getById and TabModel.getById(self_w.chip)
+        local kind = tab and tab.source and tab.source.kind
+        if kind == "hybrid" or kind == "komga" or kind == "opds" then
+            if self_w._covers_pin and self_w._covers_pin > 0 then
+                return ViewMode.COVERS
+            end
+            if self_w._isSearchResults and self_w:_isSearchResults() then
+                local ok_bs, BookshelfSettings = pcall(require, "lib/bookshelf_settings_store")
+                local m = ok_bs and BookshelfSettings and BookshelfSettings.read and BookshelfSettings.read("search_view_mode")
+                if m == ViewMode.LIST then return ViewMode.LIST end
+                if m == ViewMode.SPINES then return ViewMode.SPINES end
+                if m == ViewMode.AUTO then
+                    return ViewMode.effective(self_w._expanded, true)
+                end
+                return ViewMode.COVERS
+            end
+            local chip_mode = self_w._chipViewMode and self_w:_chipViewMode()
+            if chip_mode == ViewMode.AUTO then
+                chip_mode = ViewMode.auto(tab, self_w._isDrilledIn and self_w:_isDrilledIn())
+            end
+            if chip_mode == ViewMode.SPINES then
+                return ViewMode.SPINES
+            end
+            if chip_mode then return chip_mode end
+            return ViewMode.COVERS
+        end
+        return orig_viewMode and orig_viewMode(self_w)
+    end
+
+    -- Hook _flipViewMode to allow cycling LIST -> SPINES -> COVERS for hybrid, komga, and opds
+    local orig_flipViewMode = BookshelfWidget._flipViewMode
+    BookshelfWidget._flipViewMode = function(self_w)
+        local ok_vm, ViewMode = pcall(require, "lib/bookshelf_view_mode")
+        local ok_tm, TabModel = pcall(require, "lib/bookshelf_tab_model")
+        local tab = ok_tm and TabModel and TabModel.getById and TabModel.getById(self_w.chip)
+        local kind = tab and tab.source and tab.source.kind
+        if (kind == "hybrid" or kind == "komga" or kind == "opds") and self_w._isListMode and self_w:_isListMode() then
+            if ok_vm and ViewMode and ok_tm and TabModel then
+                if self_w._markOpdsNav then self_w:_markOpdsNav() end
+                local tabs = TabModel.load and TabModel.load()
+                local hit = nil
+                for _, t in ipairs(tabs or {}) do
+                    if t.id == self_w.chip then hit = t break end
+                end
+                if hit then
+                    hit[ViewMode.CHIP_KEY] = ViewMode.SPINES
+                    TabModel.save(tabs)
+                end
+                if self_w._rebuild then self_w:_rebuild() end
+                if UIManager and UIManager.setDirty then
+                    UIManager:setDirty(self_w, "ui")
+                end
+                return true
+            end
+        end
+        return orig_flipViewMode and orig_flipViewMode(self_w)
+    end
+
+    logger.info("[Hybrid] Hooked BookshelfWidget start feed, effective tab, and Spines viewMode methods")
 end
 
 -- ---------------------------------------------------------------------------
@@ -629,6 +695,24 @@ function M.patchCatalogSettings(Editor)
     logger.info("[Hybrid] Hooked BookshelfChipEditor._openCatalogSettings")
 end
 
+function M.patchEditorShelfStyle(Editor)
+    if type(Editor) ~= "table" or not Editor._pickGroupDisplay then return end
+    if Editor._hybrid_shelf_style_patched then return end
+    Editor._hybrid_shelf_style_patched = true
+
+    local orig_pickGroupDisplay = Editor._pickGroupDisplay
+    Editor._pickGroupDisplay = function(self_ed, draft, on_change, chrome)
+        if chrome and draft and draft.source then
+            local k = draft.source.kind
+            if k == "hybrid" or k == "komga" or k == "opds" then
+                chrome.is_opds = false
+            end
+        end
+        return orig_pickGroupDisplay(self_ed, draft, on_change, chrome)
+    end
+    logger.info("[Hybrid] Hooked BookshelfChipEditor._pickGroupDisplay for Spines style")
+end
+
 function M.installEditorPatch()
     -- 1. Hook ButtonTable.new to inject the Remote Content toggle on the main shelf editor dialog
     local ok_bt, ButtonTable = pcall(require, "ui/widget/buttontable")
@@ -638,9 +722,12 @@ function M.installEditorPatch()
         ButtonTable.new = function(self_bt, o, ...)
             o = o or {}
 
-            -- Ensure loaded Editor has _openCatalogSettings patched
+            -- Ensure loaded Editor has _openCatalogSettings and _pickGroupDisplay patched
             local loaded_ed = package.loaded["lib/bookshelf_chip_editor"]
-            if loaded_ed then M.patchCatalogSettings(loaded_ed) end
+            if loaded_ed then
+                M.patchCatalogSettings(loaded_ed)
+                M.patchEditorShelfStyle(loaded_ed)
+            end
 
             if o.buttons and type(o.buttons) == "table" then
                 local draft_found, apply_preview_fn, rebuild_fn, shelf_row_idx
@@ -716,14 +803,16 @@ function M.installEditorPatch()
     local loaded_ed = package.loaded["lib/bookshelf_chip_editor"]
     if loaded_ed then
         M.patchCatalogSettings(loaded_ed)
+        M.patchEditorShelfStyle(loaded_ed)
     else
         local ok_ed, Editor = pcall(require, "lib/bookshelf_chip_editor")
         if ok_ed and Editor then
             M.patchCatalogSettings(Editor)
+            M.patchEditorShelfStyle(Editor)
         end
     end
 
-    logger.info("[Hybrid] Hooked BookshelfChipEditor for catalog settings and shelf editor")
+    logger.info("[Hybrid] Hooked BookshelfChipEditor for catalog settings, shelf style, and shelf editor")
 end
 
 function M.installShelfRowPatch()
@@ -1023,10 +1112,236 @@ function M.installStartupPatch()
     end
 end
 
+function M.installSpineShelfPatch()
+    local ok_ss, SpineShelf = pcall(require, "lib/bookshelf_spine_shelf")
+    if not (ok_ss and SpineShelf) then return end
+    if SpineShelf._hybrid_spines_patched then return end
+    SpineShelf._hybrid_spines_patched = true
+
+    -- 1. Hook SpineShelf.plan to enforce pagination fallback (no expensive scanning)
+    local orig_plan = SpineShelf.plan
+    SpineShelf.plan = function(items, opts)
+        if items and type(items) == "table" then
+            for i = 1, #items do
+                local it = items[i]
+                if it and type(it) == "table" then
+                    if not it.page_count or it.page_count <= 0 then
+                        it.page_count = (it.komga_dto and it.komga_dto.media and it.komga_dto.media.pagesCount and it.komga_dto.media.pagesCount > 0 and it.komga_dto.media.pagesCount)
+                            or (it.active_book and it.active_book.media and it.active_book.media.pagesCount and it.active_book.media.pagesCount > 0 and it.active_book.media.pagesCount)
+                            or 200
+                    end
+                    if it.first_book and (not it.first_book.page_count or it.first_book.page_count <= 0) then
+                        it.first_book.page_count = it.page_count
+                    end
+                    if it.is_remote or it.source_kind == "hybrid" or it.is_komga then
+                        it._spine_status_checked = true
+                    end
+                end
+            end
+        end
+        return orig_plan(items, opts)
+    end
+
+    -- 2. Hook SpineShelf.bookLook to sample cover tone and aspect from cached cover image
+    local orig_bookLook = SpineShelf.bookLook
+    SpineShelf.bookLook = function(book)
+        local fp = book and (book.cover_image_path or (book.first_book and book.first_book.cover_image_path))
+        if fp and (book.is_remote or book.source_kind == "hybrid" or book.is_komga or not book.filepath or (type(book.filepath) == "string" and book.filepath:find("^%a+://"))) then
+            local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+            if ok_lfs and lfs and lfs.attributes and lfs.attributes(fp, "mode") == "file" then
+                local ok_ri, RenderImage = pcall(require, "ui/renderimage")
+                if ok_ri and RenderImage and RenderImage.renderImageFile then
+                    local ok_bb, bb = pcall(RenderImage.renderImageFile, RenderImage, fp, 60, 90)
+                    if ok_bb and bb then
+                        local w, h = bb:getWidth(), bb:getHeight()
+                        local aspect = (w and h and w > 0) and (h / w) or 1.5
+                        local n, r, g, b = 0, 0, 0, 0
+                        local steps = 8
+                        for sy = 0, steps - 1 do
+                            for sx = 0, steps - 1 do
+                                local px = math.floor((sx + 0.5) * w / steps)
+                                local py = math.floor((sy + 0.5) * h / steps)
+                                local p = bb:getPixel(px, py)
+                                local c = p and p.getColorRGB32 and p:getColorRGB32() or nil
+                                if c then
+                                    n = n + 1
+                                    r = r + c.r; g = g + c.g; b = b + c.b
+                                end
+                            end
+                        end
+                        if bb.free then bb:free() end
+                        if n > 0 then
+                            r = math.floor(r / n + 0.5)
+                            g = math.floor(g / n + 0.5)
+                            b = math.floor(b / n + 0.5)
+                            local luma = 0.299 * r + 0.587 * g + 0.114 * b
+                            if luma > 180 and luma > 0 then
+                                local factor = 180 / luma
+                                r = math.floor(r * factor + 0.5)
+                                g = math.floor(g * factor + 0.5)
+                                b = math.floor(b * factor + 0.5)
+                            end
+                            return { r = r, g = g, b = b, aspect = aspect, sampled = true }
+                        end
+                    end
+                end
+            end
+        end
+        return orig_bookLook(book)
+    end
+
+    -- 3. Hook SpineBookSlot gesture dispatch
+    local Slot = SpineShelf._SpineBookSlot
+    if Slot and not Slot._hybrid_gesture_patched then
+        Slot._hybrid_gesture_patched = true
+        local orig_onTap = Slot.onTap
+        Slot.onTap = function(self_slot, arg, ges)
+            local item = self_slot.book
+            local cbs = self_slot.callbacks
+            -- Real book records always dispatch to native book callbacks (hero selection, open)
+            if item and not item.is_folder and not item.is_opds_nav and item.kind ~= "folder" and item.kind ~= "opds_nav" and item.filepath then
+                return orig_onTap(self_slot, arg, ges)
+            end
+            if cbs and item and (item.is_folder or item.kind == "folder" or item.kind == "opds_nav" or item.is_opds_nav) then
+                local cb = nil
+                if item.kind == "opds_nav" or item.is_opds_nav then
+                    cb = cbs.on_opds_nav_tap
+                elseif item.is_folder or item.kind == "folder" then
+                    cb = cbs.on_folder_tap
+                end
+                if cb then
+                    SpineShelf.last_tapped_slot = self_slot
+                    cb(item)
+                    return true
+                end
+            end
+            return orig_onTap(self_slot, arg, ges)
+        end
+
+        local orig_onHold = Slot.onHold
+        Slot.onHold = function(self_slot)
+            local item = self_slot.book
+            local cbs = self_slot.callbacks
+            -- Real book records always dispatch to native book hold callback
+            if item and not item.is_folder and not item.is_opds_nav and item.kind ~= "folder" and item.kind ~= "opds_nav" and item.filepath then
+                return orig_onHold(self_slot)
+            end
+            if cbs and item and (item.is_folder or item.kind == "folder" or item.kind == "opds_nav" or item.is_opds_nav) then
+                local cb = nil
+                if item.kind == "opds_nav" or item.is_opds_nav then
+                    cb = cbs.on_opds_nav_hold
+                elseif item.is_folder or item.kind == "folder" then
+                    cb = cbs.on_folder_hold
+                end
+                if cb then
+                    cb(item)
+                    return true
+                end
+            end
+            return orig_onHold(self_slot)
+        end
+    end
+
+    -- 4. Hook Komga and OPDS specs for Spines shelf expansion
+        local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
+        if ok_s and Sources then
+            local function wrapSpec(kind, spec)
+                if not spec or spec._spine_wrapped then return end
+                spec._spine_wrapped = true
+                local orig_fetch = spec.fetch
+                spec.fetch = function(source, drill, offset, limit)
+                    local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
+                    local is_spine = (ok_r and Repo and Repo.spine_light == true)
+                    if not is_spine or drill then
+                        return orig_fetch(source, drill, offset, limit)
+                    end
+
+                    local records, total = orig_fetch(source, nil, 0, 100000)
+                    if not records or #records == 0 then
+                        return records, total
+                    end
+
+                    local ok_rem, Remote = pcall(require, "lib/hybrid_remote")
+                    local spine_books = {}
+                    local seen_spine_keys = {}
+                    local function spineKey(b)
+                        if not b then return nil end
+                        if b.filepath and b.filepath ~= "" then return b.filepath end
+                        if b.path and b.path ~= "" then return b.path end
+                        if b.komga_book_id or b.komga_id then
+                            return "komga://book/" .. tostring(b.komga_book_id or b.komga_id)
+                        end
+                        return nil
+                    end
+
+                    for i = 1, #records do
+                        local entry = records[i]
+                        if entry.is_folder or entry.kind == "folder" or entry.is_series or entry.komga_series_id or (type(entry.path) == "string" and entry.path:find("^komga://series/")) then
+                            if ok_rem and Remote and Remote.expandSeriesToBooks then
+                                local books = Remote.expandSeriesToBooks(source, entry, nil, nil)
+                                for _, b in ipairs(books) do
+                                    local k = spineKey(b)
+                                    if not k or not seen_spine_keys[k] then
+                                        if k then seen_spine_keys[k] = true end
+                                        spine_books[#spine_books + 1] = b
+                                    end
+                                end
+                            else
+                                local k = spineKey(entry)
+                                if not k or not seen_spine_keys[k] then
+                                    if k then seen_spine_keys[k] = true end
+                                    spine_books[#spine_books + 1] = entry
+                                end
+                            end
+                        else
+                            entry.shelf_section = entry.shelf_section or nil
+                            entry.is_folder = false
+                            entry.is_series = false
+                            entry.kind = "book"
+                            entry.page_count = (entry.page_count and entry.page_count > 0 and entry.page_count) or 200
+                            local k = spineKey(entry)
+                            if not k or not seen_spine_keys[k] then
+                                if k then seen_spine_keys[k] = true end
+                                spine_books[#spine_books + 1] = entry
+                            end
+                        end
+                    end
+
+                    local tot = #spine_books
+                    local off = offset or 0
+                    local lim = limit or tot
+                    local page = {}
+                    for i = off + 1, math.min(off + lim, tot) do
+                        page[#page + 1] = spine_books[i]
+                    end
+                    return page, tot
+                end
+            end
+
+            for _, k in ipairs({ "komga", "opds" }) do
+                if Sources.get then wrapSpec(k, Sources.get(k)) end
+            end
+
+            if Sources.register and not Sources._spine_register_hooked then
+                Sources._spine_register_hooked = true
+                local orig_reg = Sources.register
+                Sources.register = function(kind, spec)
+                    orig_reg(kind, spec)
+                    if kind == "komga" or kind == "opds" then
+                        wrapSpec(kind, spec)
+                    end
+                end
+            end
+        end
+
+    logger.info("[Hybrid] Hooked SpineShelf for Spines view support")
+end
+
 function M.installAll()
     M.installWidgetPatch()
     M.installEditorPatch()
     M.installShelfRowPatch()
+    M.installSpineShelfPatch()
     M.installStartupPatch()
 end
 

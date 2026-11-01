@@ -613,12 +613,25 @@ local SPEC = {
             local_books = filtered_local
         end
 
+        -- Detect if Spines shelf mode is active
+        local is_spine = (Repo and Repo.spine_light == true)
+        if not is_spine then
+            for _, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
+                local ok_m, m = pcall(require, mod)
+                local bw = ok_m and m and m.instance and m.instance.bookshelf
+                if bw and bw._isSpineMode and bw:_isSpineMode() then
+                    is_spine = true
+                    break
+                end
+            end
+        end
+
         -- 2. Fetch all remote records
         local remote_books, _
         if is_komga_series or is_opds_series then
-            remote_books, _ = Remote.fetchRemote(source, nil, drill)
+            remote_books, _ = Remote.fetchRemote(source, nil, drill, is_spine)
         else
-            remote_books, _ = Remote.fetchRemote(source, folder_path, drill)
+            remote_books, _ = Remote.fetchRemote(source, folder_path, drill, false)
         end
         remote_books = remote_books or {}
 
@@ -651,6 +664,59 @@ local SPEC = {
             tostring(offset),
             tostring(limit)
         ))
+
+        -- Spine shelf mode: flatten series groups into individual book records
+        if is_spine then
+            if is_komga_series or is_opds_series then
+                local sec_label = drill.label or drill.title
+                for i = 1, #merged do
+                    local b = merged[i]
+                    b.shelf_section = b.shelf_section or sec_label
+                    b.shelf_section_path = b.shelf_section_path or drill.path
+                    b.page_count = (b.page_count and b.page_count > 0 and b.page_count) or 200
+                end
+            else
+                local spine_books = {}
+                local seen_spine_keys = {}
+                local function spineKey(b)
+                    if not b then return nil end
+                    if b.filepath and b.filepath ~= "" then return b.filepath end
+                    if b.path and b.path ~= "" then return b.path end
+                    if b.komga_book_id or b.komga_id then
+                        return "komga://book/" .. tostring(b.komga_book_id or b.komga_id)
+                    end
+                    return nil
+                end
+
+                for i = 1, #merged do
+                    local entry = merged[i]
+                    if entry.is_folder or entry.kind == "folder" or entry.is_series or entry.komga_series_id or (type(entry.path) == "string" and entry.path:find("^komga://series/")) then
+                        local books = Remote.expandSeriesToBooks(source, entry, sort_priority, folder_path)
+                        for _, b in ipairs(books) do
+                            local k = spineKey(b)
+                            if not k or not seen_spine_keys[k] then
+                                if k then seen_spine_keys[k] = true end
+                                spine_books[#spine_books + 1] = b
+                            end
+                        end
+                    else
+                        entry.shelf_section = entry.shelf_section or nil
+                        entry.filepath = entry.filepath or entry.path or entry.fp
+                        entry.is_folder = false
+                        entry.is_series = false
+                        entry.kind = "book"
+                        entry.source_kind = "hybrid"
+                        entry.page_count = (entry.page_count and entry.page_count > 0 and entry.page_count) or 200
+                        local k = spineKey(entry)
+                        if not k or not seen_spine_keys[k] then
+                            if k then seen_spine_keys[k] = true end
+                            spine_books[#spine_books + 1] = entry
+                        end
+                    end
+                end
+                merged = spine_books
+            end
+        end
 
         for i = 1, #merged do
             local rec = merged[i]
@@ -690,6 +756,9 @@ local SPEC = {
                 local tb = b.title or b.display_title or b.filename or b.name or ""
                 return tostring(ta):lower() < tostring(tb):lower()
             end)
+        elseif is_spine then
+            -- Spines mode: sections stay grouped, books are ordered within their section
+            -- (mirroring Repo.getFolderSections). No cross-section reordering.
         elseif ok_se and SortEngine and SortEngine.chainedComparator and sort_priority and #sort_priority > 0 then
             local ok_s = pcall(table.sort, merged, SortEngine.chainedComparator(sort_priority))
             if not ok_s then
