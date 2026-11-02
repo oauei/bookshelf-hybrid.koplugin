@@ -556,15 +556,36 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         local q = SyncQueue.getQueue()
         local queued = q[id_str]
         if queued then
+            local server_completed = (status == "finished") or (progress and progress.completed == true)
+            local server_pct = pct or 0
+            local queued_completed = (queued.completed == true)
+
             if queued.action == "delete" then
-                status = "unread"
-                pct = 0
-            elseif queued.completed then
+                if not server_completed and server_pct == 0 then
+                    status = "unread"
+                    pct = 0
+                elseif ok_sq and SyncQueue.remove then
+                    SyncQueue.remove(id_str)
+                end
+            elseif queued_completed then
                 status = "finished"
                 pct = 1.0
+            elseif server_completed then
+                -- Server is finished, queue is not finished -> server wins!
+                if ok_sq and SyncQueue.remove then
+                    SyncQueue.remove(id_str)
+                end
             elseif queued.page and dto.media and dto.media.pagesCount and dto.media.pagesCount > 0 then
-                status = "reading"
-                pct = math.min(queued.page / dto.media.pagesCount, 0.99)
+                local queued_pct = math.min(queued.page / dto.media.pagesCount, 0.99)
+                if queued_pct > server_pct then
+                    status = "reading"
+                    pct = queued_pct
+                else
+                    -- Server is further or equal -> server wins!
+                    if ok_sq and SyncQueue.remove then
+                        SyncQueue.remove(id_str)
+                    end
+                end
             end
         end
     end
