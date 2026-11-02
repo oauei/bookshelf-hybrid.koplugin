@@ -324,6 +324,169 @@ function M.clearCoverPathCache()
     _series_title_to_id = nil
 end
 
+function M.purgeDeletedSeries(series_id, series_title)
+    if not series_id and not series_title then return false end
+    local sid_str = series_id and tostring(series_id) or nil
+    local title_key = series_title and Dedup.nameKey(series_title) or nil
+
+    logger.info(string.format("[Hybrid] Purging deleted series from caches: id=%s title=%s", tostring(sid_str), tostring(series_title)))
+
+    -- 1. Persistent cache in kokomga_bookshelf.lua
+    pcall(function()
+        local DataStorage = require("datastorage")
+        local LuaSettings = require("luasettings")
+        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+        if not s then return end
+
+        local modified = false
+
+        -- A. series table
+        local series_entries = s:readSetting("series")
+        if series_entries and sid_str and series_entries[sid_str] then
+            series_entries[sid_str] = nil
+            s:saveSetting("series", series_entries)
+            modified = true
+        end
+
+        -- B. lists table (active_queue, all_series, keep_reading, on_deck, etc.)
+        local lists = s:readSetting("lists")
+        if lists then
+            -- B1. active_queue
+            local aq = lists["active_queue"]
+            if aq and aq.items then
+                local by_s = aq.items.by_series
+                if by_s and sid_str and by_s[sid_str] then
+                    by_s[sid_str] = nil
+                    modified = true
+                end
+                if by_s and title_key then
+                    for k, v in pairs(by_s) do
+                        if v and v.seriesTitle and Dedup.nameKeysMatch(Dedup.nameKey(v.seriesTitle), title_key) then
+                            by_s[k] = nil
+                            modified = true
+                        end
+                    end
+                end
+                local s_order = aq.items.series_order
+                if s_order then
+                    local new_order = {}
+                    for _, sid in ipairs(s_order) do
+                        if tostring(sid) ~= sid_str then
+                            new_order[#new_order + 1] = sid
+                        else
+                            modified = true
+                        end
+                    end
+                    aq.items.series_order = new_order
+                end
+            end
+
+            -- B2. Other lists
+            for list_name, list_entry in pairs(lists) do
+                if list_name ~= "active_queue" and list_entry and list_entry.items and type(list_entry.items) == "table" then
+                    local new_items = {}
+                    local list_mod = false
+                    for _, item in ipairs(list_entry.items) do
+                        local match = false
+                        if sid_str and (tostring(item.id) == sid_str or tostring(item.seriesId) == sid_str) then
+                            match = true
+                        elseif title_key and (item.title or item.name) and Dedup.nameKeysMatch(Dedup.nameKey(item.title or item.name), title_key) then
+                            match = true
+                        end
+                        if match then
+                            list_mod = true
+                        else
+                            new_items[#new_items + 1] = item
+                        end
+                    end
+                    if list_mod then
+                        list_entry.items = new_items
+                        modified = true
+                    end
+                end
+            end
+
+            if modified then
+                s:saveSetting("lists", lists)
+            end
+        end
+
+        -- C. pages table (all_series|0, all_series|1, etc.)
+        local pages = s:readSetting("pages")
+        if pages then
+            local pages_mod = false
+            for pkey, pentry in pairs(pages) do
+                if pentry and pentry.items and type(pentry.items) == "table" then
+                    local new_items = {}
+                    local p_mod = false
+                    for _, item in ipairs(pentry.items) do
+                        local match = false
+                        if sid_str and (tostring(item.id) == sid_str or tostring(item.seriesId) == sid_str) then
+                            match = true
+                        elseif title_key and (item.title or item.name) and Dedup.nameKeysMatch(Dedup.nameKey(item.title or item.name), title_key) then
+                            match = true
+                        end
+                        if match then
+                            p_mod = true
+                        else
+                            new_items[#new_items + 1] = item
+                        end
+                    end
+                    if p_mod then
+                        pentry.items = new_items
+                        if pentry.total and pentry.total > 0 then
+                            pentry.total = math.max(0, pentry.total - 1)
+                        end
+                        pages_mod = true
+                    end
+                end
+            end
+            if pages_mod then
+                s:saveSetting("pages", pages)
+                modified = true
+            end
+        end
+
+        if modified then
+            s:flush()
+        end
+    end)
+
+    -- 2. In-memory caches in hybrid_remote
+    if _series_title_to_id then
+        if title_key then _series_title_to_id[title_key] = nil end
+        if sid_str then
+            for k, v in pairs(_series_title_to_id) do
+                if tostring(v) == sid_str then _series_title_to_id[k] = nil end
+            end
+        end
+    end
+    M.clearCoverPathCache()
+
+    -- 3. Cover files on disk
+    if sid_str then
+        pcall(function()
+            local DataStorage = require("datastorage")
+            local cover_dir = DataStorage:getSettingsDir() .. "/cache/komga_covers"
+            os.remove(cover_dir .. "/series_" .. sid_str .. ".jpg")
+        end)
+    end
+
+    -- 4. In-memory caches in hybrid_spec
+    local ok_sp, HybridSpec = pcall(require, "lib/hybrid_spec")
+    if ok_sp and HybridSpec and HybridSpec.clearCachesForSeries then
+        HybridSpec.clearCachesForSeries(sid_str, title_key)
+    end
+
+    -- 5. Notify bookshelf
+    local ok_src, Sources = pcall(require, "lib/bookshelf_sources")
+    if ok_src and Sources and Sources.changed then
+        Sources.changed("hybrid")
+    end
+
+    return true
+end
+
 function M.lookupSeriesIdByTitle(title)
     if type(title) ~= "string" or title == "" then return nil end
     local title_key = Dedup.nameKey(title)
@@ -1064,6 +1227,22 @@ function M.getKomgaSeriesBooks(series_id, series_title, series_summary)
                         s:flush()
                     end
                 end)
+            else
+                local resp_str = tostring(resp or ""):lower()
+                local is_404 = resp_str:find("404") ~= nil or resp_str:find("not found") ~= nil
+                if not is_404 and (not content or #content == 0) and api.get_series_detail then
+                    local ok_det, s_det = pcall(api.get_series_detail, api, series_id)
+                    local det_str = tostring(s_det or ""):lower()
+                    if not ok_det or not s_det or det_str:find("404") or det_str:find("not found") then
+                        is_404 = true
+                    end
+                end
+                if is_404 then
+                    logger.warn(string.format("[Hybrid] getKomgaSeriesBooks: series %s (%s) no longer exists on Komga (404), purging from cache",
+                        tostring(series_id), tostring(series_title)))
+                    M.purgeDeletedSeries(series_id, series_title)
+                    return {}
+                end
             end
         end
     end
@@ -1309,6 +1488,21 @@ function M.getKomgaRecords(source, drill, is_spine)
                 M.scheduleKomgaCovers({ rec })
                 return { rec }, 1
             else
+                local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
+                local can_check = not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable()
+                if can_check and series_id then
+                    local komga = getKomgaPlugin()
+                    local api = (komga and komga.api) or getKomgaApi()
+                    if api and api.get_series_detail then
+                        local ok_det, s_det = pcall(api.get_series_detail, api, series_id)
+                        local det_str = tostring(s_det or ""):lower()
+                        if not ok_det or not s_det or det_str:find("404") or det_str:find("not found") then
+                            logger.warn(string.format("[Hybrid] Next Book mode: series %s (%s) no longer exists on Komga, purging from cache",
+                                tostring(series_id), tostring(drill.label)))
+                            M.purgeDeletedSeries(series_id, drill.label)
+                        end
+                    end
+                end
                 return {}, 0
             end
         end
@@ -1370,6 +1564,22 @@ function M.getKomgaRecords(source, drill, is_spine)
                             s:flush()
                         end
                     end)
+                else
+                    local resp_str = tostring(resp or ""):lower()
+                    local is_404 = resp_str:find("404") ~= nil or resp_str:find("not found") ~= nil
+                    if not is_404 and (not content or #content == 0) and api.get_series_detail then
+                        local ok_det, s_det = pcall(api.get_series_detail, api, series_id)
+                        local det_str = tostring(s_det or ""):lower()
+                        if not ok_det or not s_det or det_str:find("404") or det_str:find("not found") then
+                            is_404 = true
+                        end
+                    end
+                    if is_404 then
+                        logger.warn(string.format("[Hybrid] getKomgaRecords: series %s (%s) no longer exists on Komga (404), purging from cache",
+                            tostring(series_id), tostring(drill.label)))
+                        M.purgeDeletedSeries(series_id, drill.label)
+                        return {}, 0
+                    end
                 end
             end
         end

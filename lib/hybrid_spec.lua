@@ -20,6 +20,26 @@ function M.clearSeriesCache()
     _series_folder_cache = {}
     _active_series_cache = {}
 end
+M.clearSeriesFolderCache = M.clearSeriesCache
+
+function M.clearCachesForSeries(sid_str, title_key)
+    if not sid_str and not title_key then
+        M.clearSeriesCache()
+        return
+    end
+    for k in pairs(_active_series_cache) do
+        local ks = tostring(k):lower()
+        if (sid_str and ks:find(sid_str:lower(), 1, true)) or (title_key and ks:find(title_key:lower(), 1, true)) then
+            _active_series_cache[k] = nil
+        end
+    end
+    for k in pairs(_series_folder_cache) do
+        local ks = tostring(k):lower()
+        if (sid_str and ks:find(sid_str:lower(), 1, true)) or (title_key and ks:find(title_key:lower(), 1, true)) then
+            _series_folder_cache[k] = nil
+        end
+    end
+end
 
 local function debugLog(msg)
     pcall(function()
@@ -627,11 +647,11 @@ local SPEC = {
         end
 
         -- 2. Fetch all remote records
-        local remote_books, _
+        local remote_books
         if is_komga_series or is_opds_series then
-            remote_books, _ = Remote.fetchRemote(source, nil, drill, is_spine)
+            remote_books = Remote.fetchRemote(source, nil, drill, is_spine)
         else
-            remote_books, _ = Remote.fetchRemote(source, folder_path, drill, false)
+            remote_books = Remote.fetchRemote(source, folder_path, drill, false)
         end
         remote_books = remote_books or {}
 
@@ -653,6 +673,35 @@ local SPEC = {
             merged = remote_books
         else
             merged = Dedup.mergeRecords(local_books, remote_books)
+        end
+
+        -- Ghost series detection: if drilled into a series with 0 local books and 0 remote books while online
+        if is_komga_series and #local_books == 0 and #remote_books == 0 and drill then
+            local sid = drill.series_id or drill.komga_series_id
+            local s_label = drill.label or drill.title
+            local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
+            local reachable = (not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable())
+            if sid and reachable then
+                logger.warn(string.format("[Hybrid] fetch: Series %s (%s) has 0 local and 0 remote books while online; purging from cache",
+                    tostring(sid), tostring(s_label)))
+                if Remote and Remote.purgeDeletedSeries then
+                    Remote.purgeDeletedSeries(sid, s_label)
+                end
+                local ok_ui, UIManager = pcall(require, "ui/uimanager")
+                local ok_notif, Notification = pcall(require, "ui/widget/notification")
+                if ok_ui and UIManager and ok_notif and Notification then
+                    UIManager:show(Notification:new{ text = _("Series no longer exists on Komga; returning to shelf.") })
+                end
+                -- Auto-eject: pop back to root shelf if currently drilled in
+                for _, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
+                    local ok_m, m = pcall(require, mod)
+                    local bw = ok_m and m and m.instance and m.instance.bookshelf
+                    if bw and bw._drilldown_path and #bw._drilldown_path > 0 then
+                        bw:_drillBackTo(0)
+                        break
+                    end
+                end
+            end
         end
 
         debugLog(string.format("[FETCH] drill=%s label=%s local=%d remote=%d merged=%d off=%s lim=%s",
@@ -826,7 +875,50 @@ local SPEC = {
             or folder.komga_id
         if series_id then
             folder.komga_series_id = series_id
-            debugLog(string.format("[OPEN_FOLDER] komga_series id=%s label=%s", tostring(series_id), tostring(folder.title or folder.label)))
+            local s_label = folder.komga_series_title or folder.title or folder.label
+            debugLog(string.format("[OPEN_FOLDER] komga_series id=%s label=%s", tostring(series_id), tostring(s_label)))
+
+            -- Pre-drill validation:
+            -- Check if folder has local files on disk. If not, it is purely remote.
+            local has_local_dir = false
+            local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+            local p = folder.path or folder.filepath
+            if p and type(p) == "string" and p:find("^/") and ok_lfs and lfs and lfs.attributes and lfs.attributes(p, "mode") == "directory" then
+                has_local_dir = true
+            end
+
+            -- If purely remote, check if series is deleted on Komga
+            if not has_local_dir then
+                local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
+                local reachable = (not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable())
+                if reachable then
+                    local komga = getKomgaPlugin()
+                    local api = (komga and komga.api) or (Remote and Remote.getKomgaApi and Remote.getKomgaApi())
+                    if api then
+                        local ok_det, s_det, err_det = false, nil, nil
+                        if api.get_series_detail then
+                            ok_det, s_det, err_det = pcall(api.get_series_detail, api, series_id)
+                        elseif api.get_books_for_series then
+                            ok_det, s_det, err_det = pcall(api.get_books_for_series, api, series_id, nil, 0, 1)
+                        end
+                        local det_str = tostring(s_det or err_det or ""):lower()
+                        local is_404 = det_str:find("404") ~= nil or det_str:find("not found") ~= nil or (ok_det and s_det == nil)
+                        if is_404 then
+                            logger.warn(string.format("[Hybrid] open_folder: Series %s (%s) no longer exists on Komga (404), blocking drilldown and purging cache",
+                                tostring(series_id), tostring(s_label)))
+                            if Remote and Remote.purgeDeletedSeries then
+                                Remote.purgeDeletedSeries(series_id, s_label)
+                            end
+                            local ok_ui, UIManager = pcall(require, "ui/uimanager")
+                            local ok_notif, Notification = pcall(require, "ui/widget/notification")
+                            if ok_ui and UIManager and ok_notif and Notification then
+                                UIManager:show(Notification:new{ text = _("Series no longer exists on Komga; removed from shelf.") })
+                            end
+                            return nil
+                        end
+                    end
+                end
+            end
             local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
             local komga_spec = ok_s and Sources and Sources.get and Sources.get("komga")
             if komga_spec and komga_spec.open_folder then

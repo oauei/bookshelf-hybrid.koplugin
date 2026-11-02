@@ -188,7 +188,32 @@ function M.installWidgetPatch()
                             series_id = series_id,
                             label = tip.label,
                         }
-                        return Repo.getBySource(src, nil, nil, offset, LIMIT, {})
+                        local res_items, res_total = Repo.getBySource(src, nil, nil, offset, LIMIT, {})
+                        if (not res_items or #res_items == 0) and (not res_total or res_total == 0) and (series_id or (pay.drill and pay.drill.series_id)) then
+                            local sid = series_id or (pay.drill and pay.drill.series_id)
+                            local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
+                            local reachable = (not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable())
+                            if reachable then
+                                local ok_rem, Remote = pcall(require, "lib/hybrid_remote")
+                                if ok_rem and Remote and Remote.purgeDeletedSeries then
+                                    Remote.purgeDeletedSeries(sid, tip.label)
+                                end
+                                -- Auto-eject: pop back to root shelf
+                                self_w._drilldown_path = {}
+                                self_w._cursor = 1
+                                self_w:_syncPageFromCursor()
+                                local ok_ui, UIManager = pcall(require, "ui/uimanager")
+                                local ok_notif, Notification = pcall(require, "ui/widget/notification")
+                                if ok_ui and UIManager and ok_notif and Notification then
+                                    UIManager:show(Notification:new{ text = _("Series no longer exists on Komga; returning to shelf.") })
+                                end
+                                local root_src = {}
+                                for k, v in pairs(tab.source) do root_src[k] = v end
+                                root_src.drill = nil
+                                return Repo.getBySource(root_src, nil, tab.sort_priority, 0, LIMIT, {})
+                            end
+                        end
+                        return res_items, res_total
                     end
                     local drill = {
                         kind = "opds_nav",
