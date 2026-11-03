@@ -647,11 +647,11 @@ local SPEC = {
         end
 
         -- 2. Fetch all remote records
-        local remote_books
+        local remote_books, _
         if is_komga_series or is_opds_series then
-            remote_books = Remote.fetchRemote(source, nil, drill, is_spine)
+            remote_books, _ = Remote.fetchRemote(source, nil, drill, is_spine)
         else
-            remote_books = Remote.fetchRemote(source, folder_path, drill, false)
+            remote_books, _ = Remote.fetchRemote(source, folder_path, drill, false)
         end
         remote_books = remote_books or {}
 
@@ -1059,21 +1059,39 @@ local SPEC = {
             end
             if done then done() end
         else
-            local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
-            local komga_spec = ok_s and Sources and Sources.get and Sources.get("komga")
-            if komga_spec and komga_spec.refresh then
-                local komga_source = {
-                    kind = "komga",
-                    list = source.komga_list or "all_series",
-                    library_id = source.library_id,
-                    library_names = source.library_names,
-                    read_status = source.read_status,
-                    status = source.status,
-                    sort = source.sort,
-                }
-                komga_spec.refresh(komga_source, drill, done)
-            elseif done then
-                done()
+            if source and source.remote_mode == "next_book" then
+                pcall(function()
+                    local DataStorage = require("datastorage")
+                    local LuaSettings = require("luasettings")
+                    local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+                    if s then
+                        local lists = s:readSetting("lists") or {}
+                        lists["active_queue"] = nil
+                        s:saveSetting("lists", lists)
+                        s:flush()
+                    end
+                end)
+                Remote.getActiveQueue(source)
+                if done then done() end
+            else
+                if drill and (drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/"))) then
+                    local sid = tostring(drill.series_id or drill.komga_series_id or drill.path:match("^komga://series/(.+)$"))
+                    pcall(function()
+                        local DataStorage = require("datastorage")
+                        local LuaSettings = require("luasettings")
+                        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+                        if s then
+                            local entries = s:readSetting("series") or {}
+                            entries[sid] = nil
+                            s:saveSetting("series", entries)
+                            s:flush()
+                        end
+                    end)
+                    Remote.getKomgaRecords(source, drill)
+                else
+                    Remote.getAllSeriesRecords(source, false, true)
+                end
+                if done then done() end
             end
         end
     end,

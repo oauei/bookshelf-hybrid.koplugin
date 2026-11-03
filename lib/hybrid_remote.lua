@@ -277,6 +277,28 @@ local function trimBooks(content, limit)
     return items
 end
 
+local function trimSeries(series)
+    local md = asTable(series.metadata) or {}
+    return {
+        id = asString(series.id),
+        title = asString(md.title) or asString(series.name),
+        summary = asString(md.summary),
+        lastModified = asString(series.lastModified),
+        booksCount = asNumber(series.booksCount),
+        booksReadCount = asNumber(series.booksReadCount),
+        booksUnreadCount = asNumber(series.booksUnreadCount),
+        booksInProgressCount = asNumber(series.booksInProgressCount),
+    }
+end
+
+local function seriesStatus(dto)
+    local total = dto.booksCount
+    local read = dto.booksReadCount or 0
+    if total and total > 0 and read >= total then return "finished" end
+    if read > 0 or (dto.booksInProgressCount or 0) > 0 then return "reading" end
+    return "unread"
+end
+
 local function createKomgaApiFallback()
     local DataStorage = require("datastorage")
     local LuaSettings = require("luasettings")
@@ -443,6 +465,39 @@ function M.purgeDeletedSeries(series_id, series_title)
             end
             if pages_mod then
                 s:saveSetting("pages", pages)
+                modified = true
+            end
+        end
+
+        -- D. all_series table
+        local all_s = s:readSetting("all_series")
+        if all_s then
+            local as_mod = false
+            for lib_key, lentry in pairs(all_s) do
+                if lentry and lentry.items and type(lentry.items) == "table" then
+                    local new_items = {}
+                    local l_mod = false
+                    for _, item in ipairs(lentry.items) do
+                        local match = false
+                        if sid_str and (tostring(item.id) == sid_str or tostring(item.seriesId) == sid_str) then
+                            match = true
+                        elseif title_key and (item.title or item.name) and Dedup.nameKeysMatch(Dedup.nameKey(item.title or item.name), title_key) then
+                            match = true
+                        end
+                        if match then
+                            l_mod = true
+                        else
+                            new_items[#new_items + 1] = item
+                        end
+                    end
+                    if l_mod then
+                        lentry.items = new_items
+                        as_mod = true
+                    end
+                end
+            end
+            if as_mod then
+                s:saveSetting("all_series", all_s)
                 modified = true
             end
         end
@@ -1174,7 +1229,219 @@ function M.getActiveSeriesRecords(source, is_spine)
     return records, #records
 end
 
-function M.getKomgaSeriesBooks(series_id, series_title, series_summary)
+local function getLibraryKey(source)
+    local lib_ids = source and source.library_id
+    if not lib_ids then return "all" end
+    if type(lib_ids) == "string" then return lib_ids ~= "" and lib_ids or "all" end
+    if type(lib_ids) == "table" then
+        local t = {}
+        for _, id in ipairs(lib_ids) do
+            if type(id) == "string" and id ~= "" then t[#t + 1] = id end
+        end
+        table.sort(t)
+        if #t > 0 then return table.concat(t, ",") end
+    end
+    return "all"
+end
+
+function M.getAllSeries(source, force_refresh)
+    ensureKomgaApiPatched()
+    local lib_key = getLibraryKey(source)
+    local cached_entry = nil
+    local fetched_at = 0
+
+    pcall(function()
+        local DataStorage = require("datastorage")
+        local LuaSettings = require("luasettings")
+        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+        if s then
+            local all_s = s:readSetting("all_series") or {}
+            local entry = all_s[lib_key]
+            if entry and entry.items then
+                cached_entry = entry.items
+                fetched_at = tonumber(entry.fetched_at) or 0
+            end
+        end
+    end)
+
+    local ttl = 180 -- 3 minutes TTL
+    local is_cache_stale = (not cached_entry or #cached_entry == 0) or ((os.time() - fetched_at) > ttl)
+    if force_refresh then is_cache_stale = true end
+
+    local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
+    local can_fetch = true
+    if ok_bh and BridgeHealth then
+        if BridgeHealth.isCircuitBreakerActive and BridgeHealth.isCircuitBreakerActive() then
+            can_fetch = false
+        elseif BridgeHealth.isServerReachable and not BridgeHealth.isServerReachable() then
+            can_fetch = false
+        end
+    end
+
+    if is_cache_stale and can_fetch then
+        local komga = getKomgaPlugin()
+        local api = (komga and komga.api) or getKomgaApi()
+        if api and type(api.query_series) == "function" then
+            local lib_param = (source and source.library_id)
+            if type(lib_param) == "string" and lib_param ~= "" then
+                lib_param = { lib_param }
+            elseif type(lib_param) ~= "table" then
+                lib_param = nil
+            end
+
+            local all_items = {}
+            local page = 0
+            local page_size = 500
+            local has_more = true
+
+            while has_more and page < 20 do
+                local ok_res, resp = pcall(api.query_series, api, {
+                    library_id = lib_param,
+                    sort = "metadata.titleSort,asc",
+                    page = page,
+                    size = page_size,
+                })
+                if not ok_res or not resp then
+                    break
+                end
+
+                local content = resp and (resp.content or (resp[1] and resp))
+                if content and type(content) == "table" then
+                    for _, s in ipairs(content) do
+                        local ts = asTable(s) and trimSeries(s)
+                        if ts and ts.id then
+                            all_items[#all_items + 1] = ts
+                        end
+                    end
+                end
+
+                if resp and resp.last == true then
+                    has_more = false
+                elseif not content or #content < page_size then
+                    has_more = false
+                else
+                    page = page + 1
+                end
+            end
+
+            if #all_items > 0 or page > 0 then
+                cached_entry = all_items
+                pcall(function()
+                    local DataStorage = require("datastorage")
+                    local LuaSettings = require("luasettings")
+                    local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+                    if s then
+                        local all_s = s:readSetting("all_series") or {}
+                        all_s[lib_key] = { fetched_at = os.time(), items = all_items, total = #all_items }
+                        s:saveSetting("all_series", all_s)
+
+                        -- Clean up any cached series in "series" section that were deleted from server
+                        local series_cache = s:readSetting("series")
+                        if series_cache and type(series_cache) == "table" then
+                            local live_ids = {}
+                            for _, item in ipairs(all_items) do
+                                live_ids[tostring(item.id)] = true
+                            end
+                            local modified_series = false
+                            for sid in pairs(series_cache) do
+                                if not live_ids[tostring(sid)] and lib_key == "all" then
+                                    series_cache[sid] = nil
+                                    modified_series = true
+                                end
+                            end
+                            if modified_series then
+                                s:saveSetting("series", series_cache)
+                            end
+                        end
+
+                        s:flush()
+                    end
+                end)
+            end
+        end
+    end
+
+    return cached_entry or {}
+end
+
+function M.getAllSeriesRecords(source, is_spine, force_refresh)
+    local series_list = M.getAllSeries(source, force_refresh)
+    if not series_list or #series_list == 0 then
+        -- Fallback: check if stock kokomga has anything in pages if all_series was empty (e.g. offline first run)
+        local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
+        local komga_spec = ok_s and Sources and Sources.get and Sources.get("komga")
+        if komga_spec and komga_spec.fetch then
+            local komga_source = {
+                kind = "komga",
+                list = source.komga_list or "all_series",
+                library_id = source.library_id,
+                library_names = source.library_names,
+                read_status = source.read_status,
+                status = source.status,
+                sort = source.sort,
+            }
+            local recs, total = komga_spec.fetch(komga_source, nil, 0, 100000)
+            if recs and #recs > 0 then
+                return recs, total or #recs
+            end
+        end
+        return {}, 0
+    end
+
+    local records = {}
+    for _, item in ipairs(series_list) do
+        local title = item.title or "?"
+        local st = seriesStatus(item)
+        local total = item.booksCount
+        local has_total = type(total) == "number" and total > 0
+        local finished = item.booksReadCount
+        if type(finished) ~= "number" and has_total and type(item.booksUnreadCount) == "number" then
+            finished = total - item.booksUnreadCount
+        end
+
+        local cp = getKomgaCoverPath("series", item.id, title)
+        local rec = {
+            id = item.id,
+            komga_series_id = item.id,
+            komga_id = item.id,
+            title = title,
+            label = title,
+            series_name = title,
+            display_title = title,
+            kind = "folder",
+            is_folder = true,
+            is_opds_nav = false,
+            source_kind = "hybrid",
+            source_nav = true,
+            path = "komga://series/" .. tostring(item.id),
+            filepath = "komga://series/" .. tostring(item.id),
+            book_count = has_total and total or nil,
+            finished_count = has_total and finished or nil,
+            finished_total = has_total and total or nil,
+            status = st,
+            read_status = st,
+            summary = item.summary,
+            komga_series_summary = item.summary,
+            cover_image_path = cp,
+            has_cover = (cp ~= nil),
+            is_remote = true,
+            is_series = true,
+            first_book = {
+                filepath = "komga://series/" .. tostring(item.id),
+                cover_image_path = cp,
+                title = title,
+                has_cover = (cp ~= nil),
+                page_count = 200,
+            },
+        }
+        records[#records + 1] = rec
+    end
+
+    M.scheduleKomgaCovers(records)
+    return records, #records
+end
+
+function M.getKomgaSeriesBooks(series_id, series_title, series_summary, allow_network)
     if not series_id then return {} end
     local cached_items = nil
     local fetched_at = 0
@@ -1204,6 +1471,16 @@ function M.getKomgaSeriesBooks(series_id, series_title, series_summary)
         end
     end
 
+    if allow_network == false then
+        can_fetch = false
+    end
+
+    local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
+    if (Repo and Repo.spine_light == true) and (not cached_items or #cached_items == 0) and allow_network ~= true then
+        -- During bulk Spines shelf expansion, avoid firing blocking synchronous network calls in a tight loop
+        can_fetch = false
+    end
+
     if is_cache_stale and can_fetch then
         local komga = getKomgaPlugin()
         local api = (komga and komga.api) or getKomgaApi()
@@ -1227,22 +1504,9 @@ function M.getKomgaSeriesBooks(series_id, series_title, series_summary)
                         s:flush()
                     end
                 end)
-            else
-                local resp_str = tostring(resp or ""):lower()
-                local is_404 = resp_str:find("404") ~= nil or resp_str:find("not found") ~= nil
-                if not is_404 and (not content or #content == 0) and api.get_series_detail then
-                    local ok_det, s_det = pcall(api.get_series_detail, api, series_id)
-                    local det_str = tostring(s_det or ""):lower()
-                    if not ok_det or not s_det or det_str:find("404") or det_str:find("not found") then
-                        is_404 = true
-                    end
-                end
-                if is_404 then
-                    logger.warn(string.format("[Hybrid] getKomgaSeriesBooks: series %s (%s) no longer exists on Komga (404), purging from cache",
-                        tostring(series_id), tostring(series_title)))
-                    M.purgeDeletedSeries(series_id, series_title)
-                    return {}
-                end
+            elseif ok_res and resp and (resp.status == 404 or (type(resp) == "table" and (resp.error == "Not Found" or resp.totalElements == 0))) then
+                cached_items = {}
+                M.purgeDeletedSeries(series_id, series_title)
             end
         end
     end
@@ -1488,21 +1752,6 @@ function M.getKomgaRecords(source, drill, is_spine)
                 M.scheduleKomgaCovers({ rec })
                 return { rec }, 1
             else
-                local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
-                local can_check = not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable()
-                if can_check and series_id then
-                    local komga = getKomgaPlugin()
-                    local api = (komga and komga.api) or getKomgaApi()
-                    if api and api.get_series_detail then
-                        local ok_det, s_det = pcall(api.get_series_detail, api, series_id)
-                        local det_str = tostring(s_det or ""):lower()
-                        if not ok_det or not s_det or det_str:find("404") or det_str:find("not found") then
-                            logger.warn(string.format("[Hybrid] Next Book mode: series %s (%s) no longer exists on Komga, purging from cache",
-                                tostring(series_id), tostring(drill.label)))
-                            M.purgeDeletedSeries(series_id, drill.label)
-                        end
-                    end
-                end
                 return {}, 0
             end
         end
@@ -1564,22 +1813,9 @@ function M.getKomgaRecords(source, drill, is_spine)
                             s:flush()
                         end
                     end)
-                else
-                    local resp_str = tostring(resp or ""):lower()
-                    local is_404 = resp_str:find("404") ~= nil or resp_str:find("not found") ~= nil
-                    if not is_404 and (not content or #content == 0) and api.get_series_detail then
-                        local ok_det, s_det = pcall(api.get_series_detail, api, series_id)
-                        local det_str = tostring(s_det or ""):lower()
-                        if not ok_det or not s_det or det_str:find("404") or det_str:find("not found") then
-                            is_404 = true
-                        end
-                    end
-                    if is_404 then
-                        logger.warn(string.format("[Hybrid] getKomgaRecords: series %s (%s) no longer exists on Komga (404), purging from cache",
-                            tostring(series_id), tostring(drill.label)))
-                        M.purgeDeletedSeries(series_id, drill.label)
-                        return {}, 0
-                    end
+                elseif ok_res and resp and (resp.status == 404 or (type(resp) == "table" and (resp.error == "Not Found" or resp.totalElements == 0))) then
+                    cached_items = {}
+                    M.purgeDeletedSeries(series_id, drill.label)
                 end
             end
         end
@@ -1677,9 +1913,8 @@ function M.getKomgaRecords(source, drill, is_spine)
     end
 
     -- 2. Root all_series query:
-    -- Ask komga_spec for all cached items (limit 100000 tells kokomga want_all=true,
-    -- which reads all cached pages instantly in <2ms from memory/disk without network blocking).
-    local records, total = komga_spec.fetch(komga_source, nil, 0, 100000)
+    -- Use active all_series cache from kokomga_bookshelf.lua with 3-minute TTL and offline fallback.
+    local records, total = M.getAllSeriesRecords(source, is_spine, false)
     records = records or {}
     total = tonumber(total) or #records
 
@@ -2266,5 +2501,8 @@ function M.setKomgaReadProgress(book_id, completed)
 end
 
 M.bookDtoToRecord = bookDtoToRecord
+M.getAllSeries = M.getAllSeries
+M.getAllSeriesRecords = M.getAllSeriesRecords
+M.purgeDeletedSeries = M.purgeDeletedSeries
 
 return M
