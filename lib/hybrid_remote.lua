@@ -1847,12 +1847,6 @@ function M.getKomgaRecords(source, drill, is_spine)
         end
     end
 
-    local ok_h, Health = pcall(require, "lib/bridge_health")
-    if ok_h and Health and Health.isServerReachable and not Health.isServerReachable() then
-        logger.info("[Hybrid] Komga server unreachable, returning empty remote records")
-        return {}, 0
-    end
-
     local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
     if ok_sq and SyncQueue and SyncQueue.hasPending and SyncQueue.hasPending() then
         local komga = getKomgaPlugin()

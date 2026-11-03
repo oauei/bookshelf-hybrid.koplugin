@@ -1059,6 +1059,26 @@ local SPEC = {
             end
             if done then done() end
         else
+            local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
+            local reachable = (not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable())
+            if not reachable then
+                -- Do not wipe disk caches when offline. Refresh simply serves cached records.
+                if source and source.remote_mode == "next_book" then
+                    Remote.getActiveQueue(source)
+                elseif drill and (drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/"))) then
+                    Remote.getKomgaRecords(source, drill)
+                else
+                    Remote.getAllSeriesRecords(source, false, false)
+                end
+                local ok_ui, UIManager = pcall(require, "ui/uimanager")
+                local ok_notif, Notification = pcall(require, "ui/widget/notification")
+                if ok_ui and UIManager and ok_notif and Notification then
+                    UIManager:show(Notification:new{ text = _("Server unreachable · Showing cached books") })
+                end
+                if done then done() end
+                return
+            end
+
             if source and source.remote_mode == "next_book" then
                 pcall(function()
                     local DataStorage = require("datastorage")
