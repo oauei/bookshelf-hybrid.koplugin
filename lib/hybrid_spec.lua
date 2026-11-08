@@ -901,8 +901,16 @@ local SPEC = {
                         elseif api.get_books_for_series then
                             ok_det, s_det, err_det = pcall(api.get_books_for_series, api, series_id, nil, 0, 1)
                         end
-                        local det_str = tostring(s_det or err_det or ""):lower()
-                        local is_404 = det_str:find("404") ~= nil or det_str:find("not found") ~= nil or (ok_det and s_det == nil)
+                        local is_404 = false
+                        if type(s_det) == "table" then
+                            if s_det.code == 404 or (type(s_det.status) == "string" and s_det.status:find("404")) then
+                                is_404 = true
+                            end
+                        elseif err_det and (tostring(err_det):find("404") or tostring(err_det):lower():find("not found")) then
+                            is_404 = true
+                        elseif ok_det and s_det == nil then
+                            is_404 = true
+                        end
                         if is_404 then
                             logger.warn(string.format("[Hybrid] open_folder: Series %s (%s) no longer exists on Komga (404), blocking drilldown and purging cache",
                                 tostring(series_id), tostring(s_label)))
