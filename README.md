@@ -29,11 +29,11 @@ Key features include:
 ## Dependencies
 
 - [KOReader](https://github.com/koreader/koreader): Document viewer for e-ink devices and Android.
-- [Bookshelf](https://github.com/koreader/koreader): Visual bookshelf plugin for KOReader.
+- [Bookshelf](https://github.com/AndyHazz/bookshelf.koplugin): Visual bookshelf plugin for KOReader.
 
 ### Recommended Integrations
 
-- [Kokomga](https://github.com/zenf/kokomga): Komga client plugin for KOReader handling remote syncing and automated downloads.
+- [Kokomga](https://github.com/JimDBh/kokomga.koplugin): Komga client plugin for KOReader handling remote syncing and automated downloads.
 - [kokomga-bookshelf-bridge.koplugin](https://github.com/oauei/kokomga-bookshelf-bridge.koplugin): Bridges credentials, profiles, cover caches, and health checks between Kokomga and Bookshelf.
 
 ## Installation
