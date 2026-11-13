@@ -74,6 +74,11 @@ end
 
 function HybridPlugin:init()
     HybridPlugin.instance = self
+
+    if self.ui and self.ui.menu then
+        self.ui.menu:registerToMainMenu(self)
+    end
+
     logger.info("[Hybrid] Initializing Bookshelf Hybrid Shelf Plugin...")
     Patch.installAll()
     HybridSpec.installSourceForwarding()
