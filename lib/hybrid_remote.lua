@@ -888,6 +888,40 @@ local _komga_covers_attempted = {}
 local _komga_queue_running = false
 local _repaint_scheduled = false
 
+local function isModalOrMenuOpen(UIManager)
+    if not UIManager then return false end
+    if UIManager._widget_list and type(UIManager._widget_list) == "table" then
+        local count = #UIManager._widget_list
+        if count > 1 then
+            for i = count, 2, -1 do
+                local w = UIManager._widget_list[i]
+                if w then
+                    local name = (w.name or ""):lower()
+                    local cls = (w.class or ""):lower()
+                    if w.is_menu or w.modal or w.dim_background
+                            or name:find("menu") or name:find("dialog")
+                            or cls:find("menu") or cls:find("dialog") then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    if UIManager.getTopWidget then
+        local top = UIManager:getTopWidget()
+        if top then
+            local name = (top.name or ""):lower()
+            local cls = (top.class or ""):lower()
+            if top.is_menu or top.modal or top.dim_background
+                    or name:find("menu") or name:find("dialog")
+                    or cls:find("menu") or cls:find("dialog") then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function scheduleRepaint(immediate)
     if _repaint_scheduled and not immediate then return end
     local delay = immediate and 0.1 or 1.5
@@ -895,6 +929,14 @@ local function scheduleRepaint(immediate)
     local ok_ui, UIManager = pcall(require, "ui/uimanager")
     if ok_ui and UIManager and UIManager.scheduleIn then
         UIManager:scheduleIn(delay, function()
+            -- If a menu or modal dialog is currently open, defer repaint so we do not
+            -- rebuild the shelf underneath the active popup and cause flashing
+            if isModalOrMenuOpen(UIManager) then
+                _repaint_scheduled = false
+                scheduleRepaint(false)
+                return
+            end
+
             _repaint_scheduled = false
             M.clearCoverPathCache()
             local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
