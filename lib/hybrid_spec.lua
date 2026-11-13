@@ -41,14 +41,19 @@ function M.clearCachesForSeries(sid_str, title_key)
     end
 end
 
+local DEBUG_DISK = false
 local function debugLog(msg)
-    pcall(function()
-        local f = io.open("/sdcard/koreader/hybrid_debug.log", "a")
-        if f then
-            f:write(os.date("%Y-%m-%d %H:%M:%S") .. " " .. tostring(msg) .. "\n")
-            f:close()
-        end
-    end)
+    if DEBUG_DISK then
+        pcall(function()
+            local f = io.open("/sdcard/koreader/hybrid_debug.log", "a")
+            if f then
+                f:write(os.date("%Y-%m-%d %H:%M:%S") .. " " .. tostring(msg) .. "\n")
+                f:close()
+            end
+        end)
+    else
+        logger.dbg("[Hybrid Spec] " .. tostring(msg))
+    end
 end
 
 local function liveModule(name)

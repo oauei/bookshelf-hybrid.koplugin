@@ -107,6 +107,21 @@ local function checkLocalReadingProgress(filepath)
     if not filepath or type(filepath) ~= "string" or filepath:find("^%a+://") then
         return nil, nil
     end
+
+    -- 1. Check in-memory BookList / BookInfo cache first
+    local ok_bl, BookList = pcall(require, "ui/widget/booklist")
+    local cached_info = ok_bl and BookList and BookList.book_info_cache and BookList.book_info_cache[filepath]
+    if cached_info then
+        local st = cached_info.status
+        local pct = tonumber(cached_info.percent_finished)
+        if (st == "complete" or st == "finished") or (pct and pct >= 0.99) then
+            return "finished", 1.0
+        elseif st == "reading" or (pct and pct > 0) then
+            return "reading", pct or 0.5
+        end
+    end
+
+    -- 2. Fallback to DocSettings.open if not in memory cache
     local ok_ds, DocSettings = pcall(require, "docsettings")
     if ok_ds and DocSettings and DocSettings.open then
         local ok_o, ds = pcall(DocSettings.open, DocSettings, filepath)
@@ -288,7 +303,21 @@ function M.syncLocalChapterStatus(local_rec, frontier_dto)
     return true
 end
 
-function M.getDownloadedMap()
+local _downloaded_map_cache = nil
+local _downloaded_map_time = 0
+local DOWNLOADED_MAP_TTL = 30 -- 30 seconds TTL
+
+function M.invalidateDownloadedMap()
+    _downloaded_map_cache = nil
+    _downloaded_map_time = 0
+end
+
+function M.getDownloadedMap(force_refresh)
+    local now = os.time()
+    if not force_refresh and _downloaded_map_cache and (now - _downloaded_map_time < DOWNLOADED_MAP_TTL) then
+        return _downloaded_map_cache
+    end
+
     local downloaded = {}
 
     -- 1. Bookshelf's own OPDS download map
@@ -352,6 +381,8 @@ function M.getDownloadedMap()
         end
     end
 
+    _downloaded_map_cache = downloaded
+    _downloaded_map_time = now
     return downloaded
 end
 
@@ -403,22 +434,26 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
                     local_books_collapsed[key:gsub("%s+", "")] = idx
                     local_books_list[#local_books_list + 1] = { key = key, idx = idx }
                 end
-                -- Update local reading progress if finished
+                -- Update local reading progress if not already completed by database query
                 if rec.filepath then
-                    local local_st, local_pct = checkLocalReadingProgress(rec.filepath)
-                    if local_st == "finished" then
-                        rec.status = "finished"
-                        rec._status = "finished"
-                        rec.read_status = "finished"
-                        rec.percent_finished = 1.0
-                        rec.book_pct = 1.0
-                        rec.is_completed = true
-                    elseif local_st == "reading" and (not rec.percent_finished or rec.percent_finished == 0) then
-                        rec.status = "reading"
-                        rec._status = "reading"
-                        rec.read_status = "reading"
-                        rec.percent_finished = local_pct
-                        rec.book_pct = local_pct
+                    local already_finished = (rec.status == "complete" or rec.status == "finished")
+                        or (rec.percent_finished and rec.percent_finished >= 0.99)
+                    if not already_finished then
+                        local local_st, local_pct = checkLocalReadingProgress(rec.filepath)
+                        if local_st == "finished" then
+                            rec.status = "finished"
+                            rec._status = "finished"
+                            rec.read_status = "finished"
+                            rec.percent_finished = 1.0
+                            rec.book_pct = 1.0
+                            rec.is_completed = true
+                        elseif local_st == "reading" and (not rec.percent_finished or rec.percent_finished == 0) then
+                            rec.status = "reading"
+                            rec._status = "reading"
+                            rec.read_status = "reading"
+                            rec.percent_finished = local_pct
+                            rec.book_pct = local_pct
+                        end
                     end
                 end
             end

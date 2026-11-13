@@ -6,14 +6,19 @@ local UIManager = require("ui/uimanager")
 local ButtonDialog = require("ui/widget/buttondialog")
 local _ = require("gettext")
 
+local DEBUG_DISK = false
 local function debugLog(msg)
-    pcall(function()
-        local f = io.open("/sdcard/koreader/hybrid_debug.log", "a")
-        if f then
-            f:write(os.date("%Y-%m-%d %H:%M:%S") .. " [PATCH] " .. tostring(msg) .. "\n")
-            f:close()
-        end
-    end)
+    if DEBUG_DISK then
+        pcall(function()
+            local f = io.open("/sdcard/koreader/hybrid_debug.log", "a")
+            if f then
+                f:write(os.date("%Y-%m-%d %H:%M:%S") .. " [PATCH] " .. tostring(msg) .. "\n")
+                f:close()
+            end
+        end)
+    else
+        logger.dbg("[Hybrid Patch] " .. tostring(msg))
+    end
 end
 
 local M = {}

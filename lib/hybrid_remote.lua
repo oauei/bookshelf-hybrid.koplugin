@@ -752,18 +752,37 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         or ((progress and progress.page) and "reading" or "unread")
 
     if local_path then
-        local ok_ds, DocSettings = pcall(require, "docsettings")
-        if ok_ds and DocSettings and DocSettings.open then
-            local ok_o, ds = pcall(DocSettings.open, DocSettings, local_path)
-            if ok_o and ds and ds.readSetting then
-                local summary = ds:readSetting("summary")
-                local lpct = tonumber(ds:readSetting("percent_finished"))
-                if (summary and type(summary) == "table" and summary.status == "complete") or (lpct and lpct >= 0.99) then
-                    status = "finished"
-                    pct = 1.0
-                elseif (summary and type(summary) == "table" and summary.status == "reading") or (lpct and lpct > 0) then
-                    status = "reading"
-                    pct = lpct
+        local found_in_cache = false
+        local ok_bl, BookList = pcall(require, "ui/widget/booklist")
+        local cached_info = ok_bl and BookList and BookList.book_info_cache and BookList.book_info_cache[local_path]
+        if cached_info then
+            local st = cached_info.status
+            local lpct = tonumber(cached_info.percent_finished)
+            if (st == "complete" or st == "finished") or (lpct and lpct >= 0.99) then
+                status = "finished"
+                pct = 1.0
+                found_in_cache = true
+            elseif st == "reading" or (lpct and lpct > 0) then
+                status = "reading"
+                pct = lpct or 0.5
+                found_in_cache = true
+            end
+        end
+
+        if not found_in_cache then
+            local ok_ds, DocSettings = pcall(require, "docsettings")
+            if ok_ds and DocSettings and DocSettings.open then
+                local ok_o, ds = pcall(DocSettings.open, DocSettings, local_path)
+                if ok_o and ds and ds.readSetting then
+                    local summary = ds:readSetting("summary")
+                    local lpct = tonumber(ds:readSetting("percent_finished"))
+                    if (summary and type(summary) == "table" and summary.status == "complete") or (lpct and lpct >= 0.99) then
+                        status = "finished"
+                        pct = 1.0
+                    elseif (summary and type(summary) == "table" and summary.status == "reading") or (lpct and lpct > 0) then
+                        status = "reading"
+                        pct = lpct
+                    end
                 end
             end
         end
@@ -869,12 +888,13 @@ local _komga_covers_attempted = {}
 local _komga_queue_running = false
 local _repaint_scheduled = false
 
-local function scheduleRepaint()
-    if _repaint_scheduled then return end
+local function scheduleRepaint(immediate)
+    if _repaint_scheduled and not immediate then return end
+    local delay = immediate and 0.1 or 1.5
     _repaint_scheduled = true
     local ok_ui, UIManager = pcall(require, "ui/uimanager")
     if ok_ui and UIManager and UIManager.scheduleIn then
-        UIManager:scheduleIn(0.5, function()
+        UIManager:scheduleIn(delay, function()
             _repaint_scheduled = false
             M.clearCoverPathCache()
             local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
@@ -924,7 +944,7 @@ local function processNextCover()
         local ok, path = pcall(plugin.cache.cacheThumbnail, plugin.cache,
             m.type_label, m.id, m.lastModified, true)
         if ok and path then
-            scheduleRepaint()
+            scheduleRepaint(false)
         end
     end
 
@@ -937,6 +957,7 @@ local function processNextCover()
         end
     else
         _komga_queue_running = false
+        scheduleRepaint(true)
     end
 end
 
@@ -2387,6 +2408,9 @@ function M.registerDownloadedBook(book, local_path)
             Repo.invalidateWalkCache()
         end
     end)
+    if Dedup and Dedup.invalidateDownloadedMap then
+        Dedup.invalidateDownloadedMap()
+    end
 end
 
 function M.deleteDownloadedBook(book, local_path)
@@ -2434,6 +2458,10 @@ function M.deleteDownloadedBook(book, local_path)
             Repo.invalidateWalkCache()
         end
     end)
+
+    if Dedup and Dedup.invalidateDownloadedMap then
+        Dedup.invalidateDownloadedMap()
+    end
 
     return true
 end
