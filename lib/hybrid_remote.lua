@@ -342,16 +342,27 @@ local _cover_path_cache = {}
 local _dir_entries_cache = {}
 local _dir_exists_cache = {}
 local _series_title_to_id = nil
+local _mem_all_series = {}
 
 function M.clearCoverPathCache()
     _cover_path_cache = {}
     _dir_entries_cache = {}
     _dir_exists_cache = {}
     _series_title_to_id = nil
+    _mem_all_series = {}
+end
+
+function M.clearAllSeriesCache(lib_key)
+    if lib_key then
+        _mem_all_series[lib_key] = nil
+    else
+        _mem_all_series = {}
+    end
 end
 
 function M.purgeDeletedSeries(series_id, series_title)
     if not series_id and not series_title then return false end
+    _mem_all_series = {}
     local sid_str = series_id and tostring(series_id) or nil
     local title_key = series_title and Dedup.nameKey(series_title) or nil
 
@@ -639,7 +650,22 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
             local entries = getDirEntries(dir)
             if entries == false then return false end
             if type(entries) == "table" then
-                return entries[fname] == true
+                if entries[fname] == true then
+                    return true
+                elseif entries[fname] == false then
+                    return false
+                end
+                local is_file = false
+                if ok_lfs and lfs and lfs.attributes then
+                    local ok_a, m = pcall(lfs.attributes, p, "mode")
+                    is_file = ok_a and m == "file"
+                end
+                if not is_file then
+                    local f = io.open(p, "rb")
+                    if f then f:close(); is_file = true end
+                end
+                entries[fname] = is_file
+                return is_file
             end
         end
         if ok_lfs and lfs and lfs.attributes then
@@ -687,6 +713,9 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
 
     -- 2. If series title is known, check local series folder cover
     if (type_label == "series" or not id) and type(title) == "string" and title ~= "" then
+        if title:find("%z") or title:find("%.%.") or title:lower():find("%%2e%%2e") or title:match("^%.+$") then
+            return nil
+        end
         local sanitized = title:gsub("[:?*\"<>/|\\]", "_")
         local local_roots = {
             "/sdcard/koreader/komga",
@@ -698,7 +727,6 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
         end
         for _, root in ipairs(local_roots) do
             local candidates = {
-                root .. "/" .. title .. "/.cover.jpg",
                 root .. "/" .. sanitized .. "/.cover.jpg",
             }
             for _, lp in ipairs(candidates) do
@@ -786,12 +814,14 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         local_path = nil
     end
 
-    local progress = dto.readProgress
-    local pct = (progress and progress.completed and 1)
-        or (progress and progress.page and dto.media and dto.media.pagesCount and math.min(progress.page / dto.media.pagesCount, 0.99))
+    local progress = (type(dto.readProgress) == "table") and dto.readProgress or nil
+    local page_count = (dto.media and type(dto.media.pagesCount) == "number") and dto.media.pagesCount or 0
+    local current_page = (progress and type(progress.page) == "number") and progress.page or 0
+    local pct = (progress and progress.completed and 1.0)
+        or (page_count > 0 and current_page > 0 and math.min(current_page / page_count, 0.99))
         or 0
     local status = (progress and progress.completed and "finished")
-        or ((progress and progress.page) and "reading" or "unread")
+        or ((progress and current_page > 0) and "reading" or "unread")
 
     if local_path then
         local found_in_cache = false
@@ -1426,25 +1456,39 @@ end
 function M.getAllSeries(source, force_refresh)
     ensureKomgaApiPatched()
     local lib_key = getLibraryKey(source)
+    local now = os.time()
+    local ttl = 180 -- 3 minutes TTL
+
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local settings_path = ok_ds and DataStorage and (DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+    local disk_mtime = (settings_path and ok_lfs and lfs and lfs.attributes) and lfs.attributes(settings_path, "modification") or 0
+
+    local mem = _mem_all_series[lib_key]
+    if not force_refresh and mem and mem.mtime == disk_mtime and (now - (mem.fetched_at or 0) < ttl) and mem.items and #mem.items > 0 then
+        return mem.items
+    end
+
     local cached_entry = nil
     local fetched_at = 0
 
-    pcall(function()
-        local DataStorage = require("datastorage")
-        local LuaSettings = require("luasettings")
-        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-        if s then
-            local all_s = s:readSetting("all_series") or {}
-            local entry = all_s[lib_key]
-            if entry and entry.items then
-                cached_entry = entry.items
-                fetched_at = tonumber(entry.fetched_at) or 0
+    if not force_refresh then
+        pcall(function()
+            local LuaSettings = require("luasettings")
+            local s = LuaSettings:open(settings_path)
+            if s then
+                local all_s = s:readSetting("all_series") or {}
+                local entry = all_s[lib_key]
+                if entry and entry.items then
+                    cached_entry = entry.items
+                    fetched_at = tonumber(entry.fetched_at) or 0
+                    _mem_all_series[lib_key] = { fetched_at = fetched_at, items = cached_entry, mtime = disk_mtime }
+                end
             end
-        end
-    end)
+        end)
+    end
 
-    local ttl = 180 -- 3 minutes TTL
-    local is_cache_stale = (not cached_entry or #cached_entry == 0) or ((os.time() - fetched_at) > ttl)
+    local is_cache_stale = (not cached_entry or #cached_entry == 0) or ((now - fetched_at) > ttl)
     if force_refresh then is_cache_stale = true end
 
     local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
@@ -1505,6 +1549,7 @@ function M.getAllSeries(source, force_refresh)
 
             if #all_items > 0 or page > 0 then
                 cached_entry = all_items
+                _mem_all_series[lib_key] = { fetched_at = os.time(), items = all_items }
                 pcall(function()
                     local DataStorage = require("datastorage")
                     local LuaSettings = require("luasettings")
@@ -1534,6 +1579,9 @@ function M.getAllSeries(source, force_refresh)
                         end
 
                         s:flush()
+                        if _mem_all_series[lib_key] then
+                            _mem_all_series[lib_key].mtime = (ok_lfs and lfs and lfs.attributes and settings_path) and lfs.attributes(settings_path, "modification") or os.time()
+                        end
                     end
                 end)
             end
@@ -2370,6 +2418,8 @@ function M.resolveDownloadDestination(book)
     else
         series_title = series_title:gsub("[/\\?%%*:|\"<>]", "_")
     end
+    series_title = series_title:gsub("%z", ""):gsub("^%.+", "_"):gsub("%.%.+", "_")
+    if series_title == "" or series_title == "_" then series_title = "unknown_series" end
 
     local dest_dir = base_dir:gsub("/+$", "") .. "/" .. series_title
     pcall(function()
@@ -2393,6 +2443,8 @@ function M.resolveDownloadDestination(book)
     else
         filename = filename:gsub("[/\\?%%*:|\"<>]", "_")
     end
+    filename = filename:gsub("%z", ""):gsub("^%.+", "_"):gsub("%.%.+", "_")
+    if filename == "" or filename == "_" then filename = "download.bin" end
 
     return dest_dir .. "/" .. filename
 end
