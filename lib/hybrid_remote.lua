@@ -339,15 +339,30 @@ local function getKomgaApi()
 end
 
 local _cover_path_cache = {}
+local _dir_entries_cache = {}
+local _dir_exists_cache = {}
 local _series_title_to_id = nil
+local _mem_all_series = {}
 
 function M.clearCoverPathCache()
     _cover_path_cache = {}
+    _dir_entries_cache = {}
+    _dir_exists_cache = {}
     _series_title_to_id = nil
+    _mem_all_series = {}
+end
+
+function M.clearAllSeriesCache(lib_key)
+    if lib_key then
+        _mem_all_series[lib_key] = nil
+    else
+        _mem_all_series = {}
+    end
 end
 
 function M.purgeDeletedSeries(series_id, series_title)
     if not series_id and not series_title then return false end
+    _mem_all_series = {}
     local sid_str = series_id and tostring(series_id) or nil
     local title_key = series_title and Dedup.nameKey(series_title) or nil
 
@@ -598,8 +613,61 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
     end
 
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local now_ts = os.time()
+    local function getDirEntries(dir)
+        if not (ok_lfs and lfs and lfs.dir and lfs.attributes) then return nil end
+        local de = _dir_exists_cache[dir]
+        if de and (now_ts - de.ts) < 60 and not de.ok then
+            return false
+        end
+        local cached_dir = _dir_entries_cache[dir]
+        if cached_dir and (now_ts - cached_dir.ts) < 30 then
+            return cached_dir.set
+        end
+        local ok_m, mode = pcall(lfs.attributes, dir, "mode")
+        if not (ok_m and mode == "directory") then
+            _dir_exists_cache[dir] = { ok = false, ts = now_ts }
+            return false
+        end
+        _dir_exists_cache[dir] = { ok = true, ts = now_ts }
+        local set = {}
+        local ok_iter = pcall(function()
+            for entry in lfs.dir(dir) do
+                if entry ~= "." and entry ~= ".." then
+                    set[entry] = true
+                end
+            end
+        end)
+        if not ok_iter then return nil end
+        _dir_entries_cache[dir] = { set = set, ts = now_ts }
+        return set
+    end
+
     local function exists(p)
         if type(p) ~= "string" or p == "" then return false end
+        local dir, fname = p:match("^(.*)/([^/]+)$")
+        if dir and fname then
+            local entries = getDirEntries(dir)
+            if entries == false then return false end
+            if type(entries) == "table" then
+                if entries[fname] == true then
+                    return true
+                elseif entries[fname] == false then
+                    return false
+                end
+                local is_file = false
+                if ok_lfs and lfs and lfs.attributes then
+                    local ok_a, m = pcall(lfs.attributes, p, "mode")
+                    is_file = ok_a and m == "file"
+                end
+                if not is_file then
+                    local f = io.open(p, "rb")
+                    if f then f:close(); is_file = true end
+                end
+                entries[fname] = is_file
+                return is_file
+            end
+        end
         if ok_lfs and lfs and lfs.attributes then
             local ok_a, m = pcall(lfs.attributes, p, "mode")
             return ok_a and m == "file"
@@ -645,6 +713,9 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
 
     -- 2. If series title is known, check local series folder cover
     if (type_label == "series" or not id) and type(title) == "string" and title ~= "" then
+        if title:find("%z") or title:find("%.%.") or title:lower():find("%%2e%%2e") or title:match("^%.+$") then
+            return nil
+        end
         local sanitized = title:gsub("[:?*\"<>/|\\]", "_")
         local local_roots = {
             "/sdcard/koreader/komga",
@@ -656,7 +727,6 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
         end
         for _, root in ipairs(local_roots) do
             local candidates = {
-                root .. "/" .. title .. "/.cover.jpg",
                 root .. "/" .. sanitized .. "/.cover.jpg",
             }
             for _, lp in ipairs(candidates) do
@@ -744,12 +814,14 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         local_path = nil
     end
 
-    local progress = dto.readProgress
-    local pct = (progress and progress.completed and 1)
-        or (progress and progress.page and dto.media and dto.media.pagesCount and math.min(progress.page / dto.media.pagesCount, 0.99))
+    local progress = (type(dto.readProgress) == "table") and dto.readProgress or nil
+    local page_count = (dto.media and type(dto.media.pagesCount) == "number") and dto.media.pagesCount or 0
+    local current_page = (progress and type(progress.page) == "number") and progress.page or 0
+    local pct = (progress and progress.completed and 1.0)
+        or (page_count > 0 and current_page > 0 and math.min(current_page / page_count, 0.99))
         or 0
     local status = (progress and progress.completed and "finished")
-        or ((progress and progress.page) and "reading" or "unread")
+        or ((progress and current_page > 0) and "reading" or "unread")
 
     if local_path then
         local found_in_cache = false
@@ -986,14 +1058,16 @@ local function processNextCover()
         local ok, path = pcall(plugin.cache.cacheThumbnail, plugin.cache,
             m.type_label, m.id, m.lastModified, true)
         if ok and path then
-            scheduleRepaint(false)
+            if (#_komga_covers_queue % 5) == 0 then
+                scheduleRepaint(false)
+            end
         end
     end
 
     if #_komga_covers_queue > 0 then
         local ok_ui, UIManager = pcall(require, "ui/uimanager")
         if ok_ui and UIManager and UIManager.scheduleIn then
-            UIManager:scheduleIn(0.1, processNextCover)
+            UIManager:scheduleIn(0.15, processNextCover)
         else
             _komga_queue_running = false
         end
@@ -1310,25 +1384,39 @@ end
 function M.getAllSeries(source, force_refresh)
     ensureKomgaApiPatched()
     local lib_key = getLibraryKey(source)
+    local now = os.time()
+    local ttl = 180 -- 3 minutes TTL
+
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local settings_path = ok_ds and DataStorage and (DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+    local disk_mtime = (settings_path and ok_lfs and lfs and lfs.attributes) and lfs.attributes(settings_path, "modification") or 0
+
+    local mem = _mem_all_series[lib_key]
+    if not force_refresh and mem and mem.mtime == disk_mtime and (now - (mem.fetched_at or 0) < ttl) and mem.items and #mem.items > 0 then
+        return mem.items
+    end
+
     local cached_entry = nil
     local fetched_at = 0
 
-    pcall(function()
-        local DataStorage = require("datastorage")
-        local LuaSettings = require("luasettings")
-        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-        if s then
-            local all_s = s:readSetting("all_series") or {}
-            local entry = all_s[lib_key]
-            if entry and entry.items then
-                cached_entry = entry.items
-                fetched_at = tonumber(entry.fetched_at) or 0
+    if not force_refresh then
+        pcall(function()
+            local LuaSettings = require("luasettings")
+            local s = LuaSettings:open(settings_path)
+            if s then
+                local all_s = s:readSetting("all_series") or {}
+                local entry = all_s[lib_key]
+                if entry and entry.items then
+                    cached_entry = entry.items
+                    fetched_at = tonumber(entry.fetched_at) or 0
+                    _mem_all_series[lib_key] = { fetched_at = fetched_at, items = cached_entry, mtime = disk_mtime }
+                end
             end
-        end
-    end)
+        end)
+    end
 
-    local ttl = 180 -- 3 minutes TTL
-    local is_cache_stale = (not cached_entry or #cached_entry == 0) or ((os.time() - fetched_at) > ttl)
+    local is_cache_stale = (not cached_entry or #cached_entry == 0) or ((now - fetched_at) > ttl)
     if force_refresh then is_cache_stale = true end
 
     local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
@@ -1389,6 +1477,7 @@ function M.getAllSeries(source, force_refresh)
 
             if #all_items > 0 or page > 0 then
                 cached_entry = all_items
+                _mem_all_series[lib_key] = { fetched_at = os.time(), items = all_items }
                 pcall(function()
                     local DataStorage = require("datastorage")
                     local LuaSettings = require("luasettings")
@@ -1418,6 +1507,9 @@ function M.getAllSeries(source, force_refresh)
                         end
 
                         s:flush()
+                        if _mem_all_series[lib_key] then
+                            _mem_all_series[lib_key].mtime = (ok_lfs and lfs and lfs.attributes and settings_path) and lfs.attributes(settings_path, "modification") or os.time()
+                        end
                     end
                 end)
             end
@@ -1915,7 +2007,12 @@ function M.getKomgaRecords(source, drill, is_spine)
         local komga = getKomgaPlugin()
         local api = (komga and komga.api) or getKomgaApi()
         if api then
-            SyncQueue.flush(api)
+            SyncQueue.flush(api, function(ok, stats_or_err)
+                if ok and type(stats_or_err) == "table" and ((stats_or_err.pushed or 0) > 0 or (stats_or_err.pruned or 0) > 0) then
+                    logger.info(string.format("[Hybrid] SyncQueue flush completed (%d pushed, %d pruned); active_queue refreshed",
+                        stats_or_err.pushed or 0, stats_or_err.pruned or 0))
+                end
+            end)
         end
     end
 
@@ -2249,6 +2346,8 @@ function M.resolveDownloadDestination(book)
     else
         series_title = series_title:gsub("[/\\?%%*:|\"<>]", "_")
     end
+    series_title = series_title:gsub("%z", ""):gsub("^%.+", "_"):gsub("%.%.+", "_")
+    if series_title == "" or series_title == "_" then series_title = "unknown_series" end
 
     local dest_dir = base_dir:gsub("/+$", "") .. "/" .. series_title
     pcall(function()
@@ -2272,6 +2371,8 @@ function M.resolveDownloadDestination(book)
     else
         filename = filename:gsub("[/\\?%%*:|\"<>]", "_")
     end
+    filename = filename:gsub("%z", ""):gsub("^%.+", "_"):gsub("%.%.+", "_")
+    if filename == "" or filename == "_" then filename = "download.bin" end
 
     return dest_dir .. "/" .. filename
 end
@@ -2334,14 +2435,37 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
         return nil, "Komga API unavailable"
     end
 
-    local http = require("socket.http")
-    local https = require("ssl.https")
-    local socketutil = require("socketutil")
-
     local url = api.base_url .. "/api/v1/books/" .. tostring(book_id) .. "/file"
     local headers = api.get_headers and api:get_headers() or {}
     headers["Accept"] = nil
     headers["User-Agent"] = "KOReader-Bookshelf"
+
+    local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
+    if (on_success_callback or on_failure_callback) and ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable() then
+        local started = AsyncHttp.downloadAsync({
+            url = url,
+            headers = headers,
+            tmp_path = tmp_path,
+            dest_path = dest_path,
+            connect_timeout = 5,
+            max_time = 120,
+        }, function(ok, code, _, err_msg)
+            if ok then
+                M.registerDownloadedBook(book, dest_path)
+                if on_success_callback then on_success_callback(dest_path) end
+            else
+                local msg = err_msg or ("HTTP Error " .. tostring(code))
+                if on_failure_callback then on_failure_callback(msg) end
+            end
+        end)
+        if started then
+            return nil
+        end
+    end
+
+    local http = require("socket.http")
+    local https = require("ssl.https")
+    local socketutil = require("socketutil")
 
     local file, open_err = io.open(tmp_path, "wb")
     if not file then

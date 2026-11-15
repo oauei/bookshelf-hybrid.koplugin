@@ -15,12 +15,16 @@ local M = {}
 
 local _series_folder_cache = {}
 local _active_series_cache = {}
+local _active_root_cache = nil
+local ROOT_CACHE_TTL = 30
 
 function M.clearSeriesCache()
     _series_folder_cache = {}
     _active_series_cache = {}
+    _active_root_cache = nil
 end
 M.clearSeriesFolderCache = M.clearSeriesCache
+M.clearRootCache = function() _active_root_cache = nil end
 
 function M.clearCachesForSeries(sid_str, title_key)
     if not sid_str and not title_key then
@@ -428,13 +432,18 @@ local SPEC = {
         local is_komga_series = drill and (drill.kind == "komga_series" or drill.kind == "series" or drill.series_id ~= nil or drill.komga_series_id ~= nil or (type(drill.path) == "string" and drill.path:find("^komga://series/")))
         local is_opds_series = drill and (drill.kind == "opds_nav" or drill.feed_url)
 
-        if not drill then
-            _active_series_cache = {}
-        end
-
+        local root_cache_key = not drill and tostring(source and (source.folder_path or source.path or "root"))
         local series_cache_key = (is_komga_series or is_opds_series) and tostring(drill.series_id or drill.komga_series_id or drill.path or drill.label or "")
         local merged = nil
-        if series_cache_key and series_cache_key ~= "" and _active_series_cache[series_cache_key] and (os.time() - _active_series_cache[series_cache_key].timestamp < 60) then
+
+        if not drill then
+            _active_series_cache = {}
+            if _active_root_cache and _active_root_cache.key == root_cache_key
+                and (os.time() - _active_root_cache.timestamp < ROOT_CACHE_TTL)
+                and (offset and offset > 0) then
+                merged = _active_root_cache.books
+            end
+        elseif series_cache_key and series_cache_key ~= "" and _active_series_cache[series_cache_key] and (os.time() - _active_series_cache[series_cache_key].timestamp < 60) then
             merged = _active_series_cache[series_cache_key].books
         end
 
@@ -827,6 +836,12 @@ local SPEC = {
                 timestamp = os.time(),
                 books = merged,
             }
+        elseif not drill and root_cache_key then
+            _active_root_cache = {
+                key = root_cache_key,
+                timestamp = os.time(),
+                books = merged,
+            }
         end
     end
 
@@ -1064,6 +1079,7 @@ local SPEC = {
     end,
 
     refresh = function(source, drill, done)
+        _active_root_cache = nil
         local remote_kind = source.remote_kind or (source.opds_id and "opds") or "komga"
         if remote_kind == "opds" then
             local ok_w, OpdsWindow = pcall(require, "lib/bookshelf_opds_window")

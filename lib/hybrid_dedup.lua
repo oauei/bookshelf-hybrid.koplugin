@@ -80,15 +80,18 @@ function M.nameKey(value)
     return value ~= "" and value or nil
 end
 
+function M.canonicalKey(k)
+    if type(k) ~= "string" or k == "" then return "" end
+    local c = k:gsub("(%w) ([stmdve]|ll|re)%f[%A]", "%1%2"):gsub("(%w) ([stmdve]|ll|re)$", "%1%2")
+    return c:gsub("%s+", "")
+end
+
 function M.nameKeysMatch(k1, k2)
     if not k1 or not k2 then return false end
     if k1 == k2 then return true end
-    if k1:gsub("%s+", "") == k2:gsub("%s+", "") then return true end
-    local c1 = k1:gsub("(%w) ([stmdve]|ll|re)%f[%A]", "%1%2"):gsub("(%w) ([stmdve]|ll|re)$", "%1%2")
-    local c2 = k2:gsub("(%w) ([stmdve]|ll|re)%f[%A]", "%1%2"):gsub("(%w) ([stmdve]|ll|re)$", "%1%2")
-    if c1 == c2 then return true end
-    if c1:gsub("%s+", "") == c2:gsub("%s+", "") then return true end
-    return false
+    local c1 = M.canonicalKey(k1)
+    local c2 = M.canonicalKey(k2)
+    return c1 ~= "" and c1 == c2
 end
 
 function M.bookKey(rec)
@@ -305,16 +308,32 @@ end
 
 local _downloaded_map_cache = nil
 local _downloaded_map_time = 0
+local _cached_mbc_ref = nil
+local _cached_mbc_count = 0
 local DOWNLOADED_MAP_TTL = 30 -- 30 seconds TTL
 
 function M.invalidateDownloadedMap()
     _downloaded_map_cache = nil
     _downloaded_map_time = 0
+    _cached_mbc_ref = nil
+    _cached_mbc_count = 0
 end
 
 function M.getDownloadedMap(force_refresh)
     local now = os.time()
-    if not force_refresh and _downloaded_map_cache and (now - _downloaded_map_time < DOWNLOADED_MAP_TTL) then
+    local ok_p, PluginLoader = pcall(require, "pluginloader")
+    local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
+    local komga = loaded and loaded["kokomga"] or nil
+    local current_mbc = komga and komga.settings and type(komga.settings.matched_books_cache) == "table" and komga.settings.matched_books_cache or nil
+    local mbc_count = 0
+    if current_mbc then
+        for _ in pairs(current_mbc) do mbc_count = mbc_count + 1 end
+    end
+
+    if not force_refresh and _downloaded_map_cache
+        and _cached_mbc_ref == current_mbc
+        and _cached_mbc_count == mbc_count
+        and (now - _downloaded_map_time < DOWNLOADED_MAP_TTL) then
         return _downloaded_map_cache
     end
 
@@ -383,6 +402,8 @@ function M.getDownloadedMap(force_refresh)
 
     _downloaded_map_cache = downloaded
     _downloaded_map_time = now
+    _cached_mbc_ref = current_mbc
+    _cached_mbc_count = mbc_count
     return downloaded
 end
 
@@ -390,8 +411,8 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
     local downloaded = M.getDownloadedMap()
     local out = {}
 
-    local local_folders, local_folders_collapsed, local_folders_list = {}, {}, {}
-    local local_books, local_books_collapsed, local_books_list = {}, {}, {}
+    local local_folders, local_folders_collapsed, local_folders_canonical, local_folders_list = {}, {}, {}, {}
+    local local_books, local_books_collapsed, local_books_canonical, local_books_list = {}, {}, {}, {}
     local local_books_by_id, local_books_by_path = {}, {}
 
     -- 1. Add all local records (they are authoritative)
@@ -411,6 +432,10 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
                 if name then
                     local_folders[name] = idx
                     local_folders_collapsed[name:gsub("%s+", "")] = idx
+                    local c_name = M.canonicalKey(name)
+                    if c_name ~= "" and not local_folders_canonical[c_name] then
+                        local_folders_canonical[c_name] = idx
+                    end
                     local_folders_list[#local_folders_list + 1] = { name = name, idx = idx }
                 end
             else
@@ -432,6 +457,10 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
                 if key then
                     local_books[key] = idx
                     local_books_collapsed[key:gsub("%s+", "")] = idx
+                    local c_key = M.canonicalKey(key)
+                    if c_key ~= "" and not local_books_canonical[c_key] then
+                        local_books_canonical[c_key] = idx
+                    end
                     local_books_list[#local_books_list + 1] = { key = key, idx = idx }
                 end
                 -- Update local reading progress if not already completed by database query
@@ -484,7 +513,9 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
                 local remote_name = M.nameKey(rec.label or rec.name or rec.title)
                 local matched_idx = nil
                 if remote_name then
-                    matched_idx = local_folders[remote_name] or local_folders_collapsed[remote_name:gsub("%s+", "")]
+                    matched_idx = local_folders[remote_name]
+                        or local_folders_collapsed[remote_name:gsub("%s+", "")]
+                        or local_folders_canonical[M.canonicalKey(remote_name)]
                     if not matched_idx and #local_folders_list <= 100 then
                         for j = 1, #local_folders_list do
                             if M.nameKeysMatch(remote_name, local_folders_list[j].name) then
@@ -544,6 +575,7 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
                     if remote_book_key then
                         matched_book_idx = local_books[remote_book_key]
                             or local_books_collapsed[remote_book_key:gsub("%s+", "")]
+                            or local_books_canonical[M.canonicalKey(remote_book_key)]
                         if not matched_book_idx and #local_books_list <= 100 then
                             for j = 1, #local_books_list do
                                 if M.nameKeysMatch(remote_book_key, local_books_list[j].key) then
