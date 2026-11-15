@@ -102,12 +102,20 @@ function M.installWidgetPatch()
                 }
             end
             if tip.kind == "source_nav" and tip.payload and tip.payload.source_kind == "hybrid" then
-                return self_w._hybridTab and self_w:_hybridTab() or nil
+                local htab = self_w._hybridTab and self_w:_hybridTab() or nil
+                if htab and htab.source and htab.source.remote_kind == "opds" then
+                    return htab
+                end
+                return nil
             end
         end
         local tab = orig_opdsEffectiveTab and orig_opdsEffectiveTab(self_w)
         if tab then return tab end
-        return self_w._hybridTab and self_w:_hybridTab() or nil
+        local htab = self_w._hybridTab and self_w:_hybridTab() or nil
+        if htab and htab.source and htab.source.remote_kind == "opds" then
+            return htab
+        end
+        return nil
     end
 
     -- Hook _currentRegisteredSource so hybrid shelf notifications are never dropped
