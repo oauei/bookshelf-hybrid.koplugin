@@ -339,10 +339,14 @@ local function getKomgaApi()
 end
 
 local _cover_path_cache = {}
+local _dir_entries_cache = {}
+local _dir_exists_cache = {}
 local _series_title_to_id = nil
 
 function M.clearCoverPathCache()
     _cover_path_cache = {}
+    _dir_entries_cache = {}
+    _dir_exists_cache = {}
     _series_title_to_id = nil
 end
 
@@ -598,8 +602,46 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
     end
 
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local now_ts = os.time()
+    local function getDirEntries(dir)
+        if not (ok_lfs and lfs and lfs.dir and lfs.attributes) then return nil end
+        local de = _dir_exists_cache[dir]
+        if de and (now_ts - de.ts) < 60 and not de.ok then
+            return false
+        end
+        local cached_dir = _dir_entries_cache[dir]
+        if cached_dir and (now_ts - cached_dir.ts) < 30 then
+            return cached_dir.set
+        end
+        local ok_m, mode = pcall(lfs.attributes, dir, "mode")
+        if not (ok_m and mode == "directory") then
+            _dir_exists_cache[dir] = { ok = false, ts = now_ts }
+            return false
+        end
+        _dir_exists_cache[dir] = { ok = true, ts = now_ts }
+        local set = {}
+        local ok_iter = pcall(function()
+            for entry in lfs.dir(dir) do
+                if entry ~= "." and entry ~= ".." then
+                    set[entry] = true
+                end
+            end
+        end)
+        if not ok_iter then return nil end
+        _dir_entries_cache[dir] = { set = set, ts = now_ts }
+        return set
+    end
+
     local function exists(p)
         if type(p) ~= "string" or p == "" then return false end
+        local dir, fname = p:match("^(.*)/([^/]+)$")
+        if dir and fname then
+            local entries = getDirEntries(dir)
+            if entries == false then return false end
+            if type(entries) == "table" then
+                return entries[fname] == true
+            end
+        end
         if ok_lfs and lfs and lfs.attributes then
             local ok_a, m = pcall(lfs.attributes, p, "mode")
             return ok_a and m == "file"
@@ -954,9 +996,37 @@ local function scheduleRepaint(immediate)
     end
 end
 
-local function processNextCover()
+local _covers_downloaded_in_batch = 0
+local processNextCover
+
+local function finishCoverStep(downloaded)
+    if downloaded then
+        _covers_downloaded_in_batch = _covers_downloaded_in_batch + 1
+    end
+    if #_komga_covers_queue > 0 then
+        if downloaded and (_covers_downloaded_in_batch % 20) == 0 then
+            scheduleRepaint(false)
+        end
+        local ok_ui, UIManager = pcall(require, "ui/uimanager")
+        if ok_ui and UIManager and UIManager.scheduleIn then
+            UIManager:scheduleIn(0.15, processNextCover)
+        else
+            _komga_queue_running = false
+            _covers_downloaded_in_batch = 0
+        end
+    else
+        _komga_queue_running = false
+        if _covers_downloaded_in_batch > 0 then
+            _covers_downloaded_in_batch = 0
+            scheduleRepaint(true)
+        end
+    end
+end
+
+processNextCover = function()
     if #_komga_covers_queue == 0 then
         _komga_queue_running = false
+        _covers_downloaded_in_batch = 0
         return
     end
 
@@ -964,6 +1034,7 @@ local function processNextCover()
     if ok_net and NetworkMgr and NetworkMgr.isConnected and not NetworkMgr:isConnected() then
         _komga_covers_queue = {}
         _komga_queue_running = false
+        _covers_downloaded_in_batch = 0
         return
     end
 
@@ -971,6 +1042,7 @@ local function processNextCover()
     if ok_h and Health and Health.isServerReachable and not Health.isServerReachable() then
         _komga_covers_queue = {}
         _komga_queue_running = false
+        _covers_downloaded_in_batch = 0
         return
     end
 
@@ -978,29 +1050,73 @@ local function processNextCover()
     if not (plugin and plugin.cache and plugin.cache.cacheThumbnail) then
         _komga_covers_queue = {}
         _komga_queue_running = false
+        _covers_downloaded_in_batch = 0
         return
     end
 
     local m = table.remove(_komga_covers_queue, 1)
-    if m then
-        local ok, path = pcall(plugin.cache.cacheThumbnail, plugin.cache,
-            m.type_label, m.id, m.lastModified, true)
-        if ok and path then
-            scheduleRepaint(false)
+    if not m then
+        finishCoverStep(false)
+        return
+    end
+
+    local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
+    local api = plugin.api
+    local base_url = api and api.base_url
+    if ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
+            and AsyncHttp.downloadAsync and base_url and base_url ~= "" then
+        local ok_ds, DataStorage = pcall(require, "datastorage")
+        if ok_ds and DataStorage then
+            pcall(plugin.cache.ensureStructure, plugin.cache)
+            local covers_dir = DataStorage:getDataDir() .. "/komga_covers"
+            local cache_key = tostring(m.type_label) .. "_" .. tostring(m.id)
+            local dest_path = covers_dir .. "/" .. cache_key .. ".jpg"
+            local endpoint_type = (m.type_label == "series") and "series" or "books"
+            local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/" .. endpoint_type .. "/" .. tostring(m.id) .. "/thumbnail"
+            local headers = {}
+            if api.get_headers then
+                local ok_hdr, h = pcall(api.get_headers, api)
+                if ok_hdr and type(h) == "table" then
+                    for k, v in pairs(h) do headers[k] = v end
+                end
+            end
+            local ok_ba, BridgeAuth = pcall(require, "lib/bridge_auth")
+            if ok_ba and BridgeAuth and BridgeAuth.getAuthHeaders then
+                local extra = BridgeAuth.getAuthHeaders(url)
+                if type(extra) == "table" then
+                    for k, v in pairs(extra) do
+                        if not headers[k] then headers[k] = v end
+                    end
+                end
+            end
+            local launched = AsyncHttp.downloadAsync({
+                url = url,
+                headers = headers,
+                tmp_path = dest_path .. ".tmp",
+                dest_path = dest_path,
+                connect_timeout = 2,
+                max_time = 8,
+            }, function(ok)
+                if ok then
+                    local meta_cache = plugin.settings and plugin.settings.library_metadata_cache
+                    if meta_cache and meta_cache.covers then
+                        meta_cache.covers[cache_key] = m.lastModified
+                        if plugin.saveSettings then
+                            pcall(plugin.saveSettings, plugin)
+                        end
+                    end
+                end
+                finishCoverStep(ok == true)
+            end)
+            if launched then
+                return
+            end
         end
     end
 
-    if #_komga_covers_queue > 0 then
-        local ok_ui, UIManager = pcall(require, "ui/uimanager")
-        if ok_ui and UIManager and UIManager.scheduleIn then
-            UIManager:scheduleIn(0.1, processNextCover)
-        else
-            _komga_queue_running = false
-        end
-    else
-        _komga_queue_running = false
-        scheduleRepaint(true)
-    end
+    local ok, path = pcall(plugin.cache.cacheThumbnail, plugin.cache,
+        m.type_label, m.id, m.lastModified, true)
+    finishCoverStep(ok and path ~= nil)
 end
 
 function M.scheduleKomgaCovers(records)
@@ -1915,7 +2031,12 @@ function M.getKomgaRecords(source, drill, is_spine)
         local komga = getKomgaPlugin()
         local api = (komga and komga.api) or getKomgaApi()
         if api then
-            SyncQueue.flush(api)
+            SyncQueue.flush(api, function(ok, stats_or_err)
+                if ok and type(stats_or_err) == "table" and ((stats_or_err.pushed or 0) > 0 or (stats_or_err.pruned or 0) > 0) then
+                    logger.info(string.format("[Hybrid] SyncQueue flush completed (%d pushed, %d pruned); active_queue refreshed",
+                        stats_or_err.pushed or 0, stats_or_err.pruned or 0))
+                end
+            end)
         end
     end
 
@@ -2334,14 +2455,37 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
         return nil, "Komga API unavailable"
     end
 
-    local http = require("socket.http")
-    local https = require("ssl.https")
-    local socketutil = require("socketutil")
-
     local url = api.base_url .. "/api/v1/books/" .. tostring(book_id) .. "/file"
     local headers = api.get_headers and api:get_headers() or {}
     headers["Accept"] = nil
     headers["User-Agent"] = "KOReader-Bookshelf"
+
+    local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
+    if (on_success_callback or on_failure_callback) and ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable() then
+        local started = AsyncHttp.downloadAsync({
+            url = url,
+            headers = headers,
+            tmp_path = tmp_path,
+            dest_path = dest_path,
+            connect_timeout = 5,
+            max_time = 120,
+        }, function(ok, code, _, err_msg)
+            if ok then
+                M.registerDownloadedBook(book, dest_path)
+                if on_success_callback then on_success_callback(dest_path) end
+            else
+                local msg = err_msg or ("HTTP Error " .. tostring(code))
+                if on_failure_callback then on_failure_callback(msg) end
+            end
+        end)
+        if started then
+            return nil
+        end
+    end
+
+    local http = require("socket.http")
+    local https = require("ssl.https")
+    local socketutil = require("socketutil")
 
     local file, open_err = io.open(tmp_path, "wb")
     if not file then
