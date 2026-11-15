@@ -1089,8 +1089,12 @@ local SPEC = {
             if done then done() end
         else
             local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
-            local reachable = (not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable())
+            local reachable, reach_reason = true, nil
+            if ok_bh and BridgeHealth and BridgeHealth.isServerReachable then
+                reachable, reach_reason = BridgeHealth.isServerReachable(nil, true)
+            end
             if not reachable then
+                logger.info("[Hybrid] refresh: server unreachable (" .. tostring(reach_reason) .. "), serving cached books")
                 -- Do not wipe disk caches when offline. Refresh simply serves cached records.
                 if source and source.remote_mode == "next_book" then
                     Remote.getActiveQueue(source)
