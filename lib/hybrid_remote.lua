@@ -107,9 +107,9 @@ local function parseHttpUrl(url)
     scheme = scheme:lower()
     if scheme ~= "http" and scheme ~= "https" then return nil end
     local authority = rest:match("^([^/?#]+)")
-    if not authority or authority == "" then return nil end
-    -- Strip optional userinfo
-    local hostport = authority:match("@(.+)$") or authority
+    if not authority or authority == "" or authority:find("\\", 1, true) then return nil end
+    -- Strip optional userinfo (match last @)
+    local hostport = authority:match("^.*@([^@]+)$") or authority
     local host, port_str
     if hostport:sub(1, 1) == "[" then
         host, port_str = hostport:match("^(%b[]):?(%d*)$")
@@ -206,26 +206,36 @@ local function copyFileChunked(src_path, dst_path, chunk_size)
 end
 
 local function resolveCaBundle()
-    local candidates = {
+    local file_candidates = {
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/ssl/cert.pem",
-        "/system/etc/security/cacerts",
     }
     local ok_ds, DataStorage = pcall(require, "datastorage")
     if ok_ds and DataStorage and DataStorage.getDataDir then
         local dd = DataStorage:getDataDir()
         if type(dd) == "string" and dd ~= "" then
-            table.insert(candidates, 1, dd .. "/data/ca-bundle.crt")
+            table.insert(file_candidates, 1, dd .. "/data/ca-bundle.crt")
         end
     end
-    for _, path in ipairs(candidates) do
-        local f = io.open(path, "rb")
-        if f then
-            f:close()
-            return path
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    for _, path in ipairs(file_candidates) do
+        local is_file = false
+        if ok_lfs and lfs and lfs.attributes then
+            local ok_a, mode = pcall(lfs.attributes, path, "mode")
+            is_file = ok_a and mode == "file"
+        else
+            local f = io.open(path, "rb")
+            if f then f:close(); is_file = true end
+        end
+        if is_file then return path, nil end
+    end
+    if ok_lfs and lfs and lfs.attributes then
+        local ok_a, mode = pcall(lfs.attributes, "/system/etc/security/cacerts", "mode")
+        if ok_a and mode == "directory" then
+            return nil, "/system/etc/security/cacerts"
         end
     end
-    return nil
+    return nil, nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -1332,7 +1342,7 @@ end
 local _covers_downloaded_in_batch = 0
 local processNextCover
 
-local function abortCoverQueue(reason)
+local function abortCoverQueue(_reason)
     -- Clear queued/in-flight markers so aborted covers remain retryable after reconnect
     for _, item in ipairs(_komga_covers_queue) do
         if item and item.key and _komga_covers_attempts[item.key] and _komga_covers_attempts[item.key].state == "queued" then
@@ -2591,9 +2601,12 @@ function M.getOpdsDrillRecords(source, drill)
         local ok_s, OpdsSource = pcall(require, "lib/bookshelf_opds_source")
         if ok_f and OpdsFeed and ok_s and OpdsSource then
             local server = OpdsSource.getServer(server_key)
-            local base_url = server and server.url
-            if base_url and not isSameHost(feed_url, base_url) then
-                logger.warn("[Hybrid] getOpdsDrillRecords blocked cross-host OPDS fetch: " .. sanitizeLog(feed_url))
+            if not server and source and (source.opds_id or source.id) then
+                server = OpdsSource.getServer(source.opds_id or source.id)
+            end
+            local base_url = (server and server.url) or (source and source.feed_url)
+            if not base_url or not isSameHost(feed_url, base_url) then
+                logger.warn("[Hybrid] getOpdsDrillRecords blocked unverified or cross-host OPDS fetch: " .. sanitizeLog(feed_url))
                 return {}, 0
             end
             local user, pass = nil, nil
@@ -2919,7 +2932,7 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
         socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT or 30, socketutil.FILE_TOTAL_TIMEOUT or 300)
     end)
 
-    local ca_bundle = resolveCaBundle()
+    local ca_bundle, ca_path = resolveCaBundle()
     local cur_url = url
     local cur_headers = copyTableShallow(headers)
     local ok_req, res, code, res_headers, status
@@ -2940,6 +2953,7 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
         if parsed.scheme == "https" then
             request_params.verify = "peer"
             if ca_bundle then request_params.cafile = ca_bundle end
+            if ca_path then request_params.capath = ca_path end
             ok_req, res, code, res_headers, status = safeCall("downloadKomgaBook.https.request", https.request, request_params)
         else
             ok_req, res, code, res_headers, status = safeCall("downloadKomgaBook.http.request", http.request, request_params)
