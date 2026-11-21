@@ -5,6 +5,40 @@ local logger = require("logger")
 
 local M = {}
 
+local MAX_NORMALIZE_LEN = 512
+
+local function asFiniteNumber(v)
+    local n = tonumber(v)
+    if type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge then
+        return n
+    end
+    return nil
+end
+
+local function firstFiniteNumber(...)
+    for i = 1, select("#", ...) do
+        local n = asFiniteNumber(select(i, ...))
+        if n then return n end
+    end
+    return nil
+end
+
+local function isSafeLocalFilePath(p)
+    if type(p) ~= "string" or p == "" or p:find("%z") then return false end
+    if p:find("^%a+://") then return false end
+    if not p:find("^/") then return false end
+    if p:find("/%.%./") or p:find("/%.%.$") or p:find("^%.%./") or p == ".." then return false end
+    return true
+end
+
+local function updateBookListCache(filepath, status_val, pct_val)
+    local ok_bl, BookList = pcall(require, "ui/widget/booklist")
+    if ok_bl and BookList and BookList.setBookInfoCacheProperty then
+        pcall(BookList.setBookInfoCacheProperty, filepath, "status", status_val)
+        pcall(BookList.setBookInfoCacheProperty, filepath, "percent_finished", pct_val)
+    end
+end
+
 local _hybrid_unescape_map = {
     lt = "<", gt = ">", amp = "&", quot = '"', apos = "'",
     rsquo = "'", lsquo = "'", rdquo = '"', ldquo = '"',
@@ -12,13 +46,14 @@ local _hybrid_unescape_map = {
 }
 
 function M.unescapeHtml(str)
-    if type(str) ~= "string" or not str:find("&") then return str end
+    if type(str) ~= "string" or not str:find("&", 1, true) then return str end
     return (str:gsub('(&(#?)([%d%a]+);)', function(orig, n, s)
         if _hybrid_unescape_map[s] then return _hybrid_unescape_map[s] end
         if n == "#" then
             local cp = (s:sub(1, 1) == "x" or s:sub(1, 1) == "X")
                 and tonumber(s:sub(2), 16) or tonumber(s)
             if cp then
+                if cp < 32 or cp == 127 or cp > 0x10FFFF then return "" end
                 if cp < 128 then return string.char(cp) end
                 if cp == 8217 or cp == 8216 or cp == 8219 or cp == 8242 then return "'" end
                 if cp == 8220 or cp == 8221 then return '"' end
@@ -63,6 +98,9 @@ local _multibyte_punct = {
 
 function M.nameKey(value)
     if type(value) ~= "string" then return nil end
+    if #value > MAX_NORMALIZE_LEN then
+        value = value:sub(1, MAX_NORMALIZE_LEN)
+    end
     value = M.unescapeHtml(value)
     local ok_util, util = pcall(require, "util")
     if ok_util and util then
@@ -76,14 +114,14 @@ function M.nameKey(value)
         return _multibyte_punct[ch] or ch
     end)
     value = value:gsub("[%p]", " ")
-    value = value:gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+    value = value:gsub("%s+", " ")
+    value = value:match("^%s*(.-)%s*$") or ""
     return value ~= "" and value or nil
 end
 
 function M.canonicalKey(k)
     if type(k) ~= "string" or k == "" then return "" end
-    local c = k:gsub("(%w) ([stmdve]|ll|re)%f[%A]", "%1%2"):gsub("(%w) ([stmdve]|ll|re)$", "%1%2")
-    return c:gsub("%s+", "")
+    return (k:gsub("%s+", ""))
 end
 
 function M.nameKeysMatch(k1, k2)
@@ -120,7 +158,7 @@ local function checkLocalReadingProgress(filepath)
         if (st == "complete" or st == "finished") or (pct and pct >= 0.99) then
             return "finished", 1.0
         elseif st == "reading" or (pct and pct > 0) then
-            return "reading", pct or 0.5
+            return "reading", pct or 0
         end
     end
 
@@ -130,64 +168,111 @@ local function checkLocalReadingProgress(filepath)
         local ok_o, ds = pcall(DocSettings.open, DocSettings, filepath)
         if ok_o and ds and ds.readSetting then
             local summary = ds:readSetting("summary")
-            local pct = tonumber(ds:readSetting("percent_finished"))
+            local pct = asFiniteNumber(ds:readSetting("percent_finished"))
             if (summary and type(summary) == "table" and summary.status == "complete") or (pct and pct >= 0.99) then
                 return "finished", 1.0
             elseif (summary and type(summary) == "table" and summary.status == "reading") or (pct and pct > 0) then
-                return "reading", pct
+                return "reading", pct or 0
             end
         end
     end
     return nil, nil
 end
 
+local function parseChapterFromString(str)
+    if type(str) ~= "string" or str == "" then return nil end
+    if #str > MAX_NORMALIZE_LEN then str = str:sub(1, MAX_NORMALIZE_LEN) end
+    -- Remove extension (.cbz, .cbr, .epub, .pdf, etc.)
+    str = str:gsub("%.%a%w%w?%w?$", "")
+    str = str:match("^%s*(.-)%s*$") or ""
+    if str == "" then return nil end
+
+    -- Helper matching decimal first then integer (zero overlapping quantifiers -> linear time)
+    local function matchNum(pat_dec, pat_int)
+        local s = str:match(pat_dec) or str:match(pat_int)
+        return s and asFiniteNumber(s) or nil
+    end
+
+    -- 1. Chapter markers with word boundary: "Chapter 3", "ch. 03", "Ch3", "ch 3"
+    local n = matchNum("%f[%a][Cc]h[%a]*[%s_%.%-]*(%d+%.%d+)", "%f[%a][Cc]h[%a]*[%s_%.%-]*(%d+)")
+    if n then return n end
+
+    -- 2. Hash marker: "#03", "# 3", fullwidth "＃3" (separate from byte class to avoid UTF-8 corruption)
+    n = matchNum("#[%s_]*(%d+%.%d+)", "#[%s_]*(%d+)")
+        or matchNum("\xEF\xBC\x83[%s_]*(%d+%.%d+)", "\xEF\xBC\x83[%s_]*(%d+)")
+    if n then return n end
+
+    -- 3. Volume and chapter: "v01 c03", "v1 - 03", "Vol 1 Ch 3"
+    n = matchNum("%f[%a][Vv]ol?%d+[%s_%.%-]+[Cc]?(%d+%.%d+)", "%f[%a][Vv]ol?%d+[%s_%.%-]+[Cc]?(%d+)")
+    if n then return n end
+
+    -- 4. " - 03", " - 3.5" (standard "Series - 03")
+    n = matchNum("%s+%-%s+(%d+%.%d+)", "%s+%-%s+(%d+)")
+    if n then return n end
+
+    -- 5. Trailing number: "Series Name 03", "Series 3" (already trimmed, unambiguous)
+    n = matchNum("[%s_](%d+%.%d+)$", "[%s_](%d+)$")
+    if n then return n end
+
+    -- 6. Leading number: "03 - Series", "03.cbz"
+    n = matchNum("^(%d+%.%d+)[%s_%.%-]", "^(%d+)[%s_%.%-]")
+    if n then return n end
+
+    -- 7. Exact number only: "03"
+    n = matchNum("^(%d+%.%d+)$", "^(%d+)$")
+    if n then return n end
+
+    return nil
+end
+
 function M.extractChapterNumber(rec)
     if not rec then return nil end
 
-    if type(rec) == "number" then return rec end
+    if type(rec) == "number" then return asFiniteNumber(rec) end
     if type(rec) == "string" then
-        local n = tonumber(rec)
+        local n = asFiniteNumber(rec)
         if n then return n end
+        return parseChapterFromString(rec)
     end
 
     if type(rec) ~= "table" then return nil end
 
-    -- 1. Direct fields
-    local num = tonumber(rec.series_index or rec.series_num or rec.numberSort or rec.number)
+    -- 1. Direct fields (checked individually so non-numeric strings do not shadow numberSort)
+    local num = firstFiniteNumber(rec.series_index, rec.series_num, rec.numberSort, rec.number)
     if num then return num end
 
     -- 2. Metadata table
     if type(rec.metadata) == "table" then
-        local m_num = tonumber(rec.metadata.numberSort or rec.metadata.number or rec.metadata.series_index)
+        local m_num = firstFiniteNumber(rec.metadata.numberSort, rec.metadata.number, rec.metadata.series_index)
         if m_num then return m_num end
     end
 
     -- 3. Komga DTO
     if type(rec.komga_dto) == "table" then
         local k_dto = rec.komga_dto
-        local k_num = tonumber(k_dto.numberSort or k_dto.number)
+        local k_num = firstFiniteNumber(k_dto.numberSort, k_dto.number)
         if k_num then return k_num end
         if type(k_dto.metadata) == "table" then
-            k_num = tonumber(k_dto.metadata.numberSort or k_dto.metadata.number)
+            k_num = firstFiniteNumber(k_dto.metadata.numberSort, k_dto.metadata.number)
             if k_num then return k_num end
         end
     end
 
-    -- 4. DocSettings sidecar properties (doc_props or custom_props)
+    -- 4. DocSettings sidecar properties (only on verified local paths)
     local fp = rec.filepath or rec.path
-    if fp and type(fp) == "string" and not fp:find("^%a+://") then
+    if not rec.is_remote and isSafeLocalFilePath(fp) then
         local ok_ds, DocSettings = pcall(require, "docsettings")
         if ok_ds and DocSettings and DocSettings.open then
             local ok_o, ds = pcall(DocSettings.open, DocSettings, fp)
             if ok_o and ds and ds.readSetting then
                 local dp = ds:readSetting("doc_props")
                 if type(dp) == "table" then
-                    local s_idx = tonumber(dp.series_index)
+                    local s_idx = asFiniteNumber(dp.series_index)
                     if s_idx then return s_idx end
                 end
                 local cp = ds:readSetting("custom_props")
                 if type(cp) == "table" then
-                    local s_idx = tonumber(cp.series_index)
+                    local s_idx = asFiniteNumber(cp.series_index)
                     if s_idx then return s_idx end
                 end
             end
@@ -199,65 +284,44 @@ function M.extractChapterNumber(rec)
     if type(str) ~= "string" and fp and type(fp) == "string" then
         str = fp:match("([^/]+)$")
     end
-    if type(str) == "string" then
-        -- Remove extension (.cbz, .cbr, .epub, .pdf, etc.)
-        str = str:gsub("%.%a%w%w?%w?$", "")
+    return parseChapterFromString(str)
+end
 
-        -- Chapter markers: "Chapter 3", "ch. 03", "c3.5", "Ch3", "ch 3"
-        local ch_str = str:match("[Cc]h[%a]*[%s_%.%-]*([%d]+%.?[%d]*)")
-        if ch_str then
-            local n = tonumber(ch_str)
-            if n then return n end
-        end
-
-        -- Hash marker: "#03", "# 3"
-        local hash_str = str:match("[#＃][%s_]*([%d]+%.?[%d]*)")
-        if hash_str then
-            local n = tonumber(hash_str)
-            if n then return n end
-        end
-
-        -- Volume and chapter: "v01 c03", "v1 - 03", "Vol 1 Ch 3"
-        local vol_ch_str = str:match("[Vv]ol?%d+[%s_%.%-]+[Cc]?(%d+%.?%d*)")
-        if vol_ch_str then
-            local n = tonumber(vol_ch_str)
-            if n then return n end
-        end
-
-        -- " - 03", " - 3.5" (standard "Series - 03")
-        local dash_num = str:match("%s+%-%s+([%d]+%.?[%d]*)")
-        if dash_num then
-            local n = tonumber(dash_num)
-            if n then return n end
-        end
-
-        -- Trailing number: "Series Name 03", "Series 3"
-        local trailing_num = str:match("[%s_]+([%d]+%.?[%d]*)%s*$")
-        if trailing_num then
-            local n = tonumber(trailing_num)
-            if n then return n end
-        end
-
-        -- Leading number: "03 - Series", "03.cbz"
-        local leading_num = str:match("^([%d]+%.?[%d]*)[%s_%.%-]+")
-        if leading_num then
-            local n = tonumber(leading_num)
-            if n then return n end
-        end
-
-        -- Exact number only: "03"
-        local exact_num = str:match("^([%d]+%.?[%d]*)$")
-        if exact_num then
-            local n = tonumber(exact_num)
-            if n then return n end
-        end
+local function isActiveFrontierRecord(r)
+    if type(r) ~= "table" then return false end
+    if r.is_folder or r.kind == "folder" then return false end
+    if r.status == "reading" or r.status == "finished" or r.read_status == "reading" or r.read_status == "finished" then
+        return true
     end
-
-    return nil
+    local pct = asFiniteNumber(r.percent_finished)
+    if pct and pct > 0 then return true end
+    local rp = type(r.readProgress) == "table" and r.readProgress
+        or (type(r.komga_dto) == "table" and type(r.komga_dto.readProgress) == "table" and r.komga_dto.readProgress)
+    if rp then
+        local p = asFiniteNumber(rp.page) or 0
+        if rp.completed == true or p > 0 then return true end
+    end
+    return false
 end
 
 function M.syncLocalChapterStatus(local_rec, frontier_dto)
-    if not local_rec or not frontier_dto then return false end
+    if type(local_rec) ~= "table" or type(frontier_dto) ~= "table" then return false end
+    if local_rec.is_remote == true then return false end
+
+    -- Verify same series if both sides carry series identity
+    local l_sid = local_rec.komga_series_id or (type(local_rec.komga_dto) == "table" and local_rec.komga_dto.seriesId)
+    local f_sid = frontier_dto.komga_series_id or frontier_dto.seriesId or (type(frontier_dto.komga_dto) == "table" and frontier_dto.komga_dto.seriesId)
+    if l_sid and f_sid and tostring(l_sid) ~= tostring(f_sid) then
+        return false
+    end
+    local l_sname = local_rec.series_name
+    local f_sname = frontier_dto.series_name or frontier_dto.seriesTitle
+    if not (l_sid and f_sid) and type(l_sname) == "string" and type(f_sname) == "string" and l_sname ~= "" and f_sname ~= "" then
+        if not M.nameKeysMatch(M.nameKey(l_sname), M.nameKey(f_sname)) then
+            return false
+        end
+    end
+
     local frontier_num = M.extractChapterNumber(frontier_dto)
     local local_num = M.extractChapterNumber(local_rec)
 
@@ -273,16 +337,16 @@ function M.syncLocalChapterStatus(local_rec, frontier_dto)
     local_rec.book_pct = 1.0
     local_rec.is_completed = true
 
-    -- Update .sdr sidecar on disk if local file exists
+    -- Update .sdr sidecar on disk if verified local file
     local filepath = local_rec.filepath or local_rec.path
-    if filepath and type(filepath) == "string" and not filepath:find("^%a+://") then
+    if isSafeLocalFilePath(filepath) then
         local ok_ds, DocSettings = pcall(require, "docsettings")
         if ok_ds and DocSettings and DocSettings.open then
             local ok_o, ds = pcall(DocSettings.open, DocSettings, filepath)
             if ok_o and ds and ds.readSetting then
                 local summary = ds:readSetting("summary")
                 if type(summary) ~= "table" then summary = {} end
-                local current_pct = tonumber(ds:readSetting("percent_finished")) or 0
+                local current_pct = asFiniteNumber(ds:readSetting("percent_finished")) or 0
                 if summary.status ~= "complete" or current_pct < 1.0 then
                     summary.status = "complete"
                     summary.modified = os.date("%Y-%m-%d")
@@ -295,12 +359,7 @@ function M.syncLocalChapterStatus(local_rec, frontier_dto)
             end
         end
 
-        -- Update BookList cache if available
-        local ok_bl, BookList = pcall(require, "apps/filemanager/booklist")
-        if ok_bl and BookList and BookList.setBookInfoCacheProperty then
-            pcall(BookList.setBookInfoCacheProperty, BookList, filepath, "status", "complete")
-            pcall(BookList.setBookInfoCacheProperty, BookList, filepath, "percent_finished", 1.0)
-        end
+        updateBookListCache(filepath, "complete", 1.0)
     end
 
     return true
@@ -408,6 +467,8 @@ function M.getDownloadedMap(force_refresh)
 end
 
 function M.mergeRecords(local_records, remote_records, frontier_dto)
+    local_records = type(local_records) == "table" and local_records or {}
+    remote_records = type(remote_records) == "table" and remote_records or {}
     local downloaded = M.getDownloadedMap()
     local out = {}
 
@@ -607,8 +668,9 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
                             local_book.has_cover = true
                         end
                         -- If remote shows finished, mark local as finished and sync .sdr sidecar
+                        local k_rp = type(rec.komga_dto) == "table" and type(rec.komga_dto.readProgress) == "table" and rec.komga_dto.readProgress or nil
                         local remote_finished = (rec.status == "finished" or rec.read_status == "finished" or rec.percent_finished == 1.0
-                            or (rec.komga_dto and rec.komga_dto.readProgress and rec.komga_dto.readProgress.completed))
+                            or (k_rp and k_rp.completed == true))
                         if remote_finished then
                             local_book.status = "finished"
                             local_book._status = "finished"
@@ -618,14 +680,14 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
                             local_book.is_completed = true
 
                             local fp = local_book.filepath or local_book.path
-                            if fp and type(fp) == "string" and not fp:find("^%a+://") then
+                            if isSafeLocalFilePath(fp) then
                                 local ok_ds, DocSettings = pcall(require, "docsettings")
                                 if ok_ds and DocSettings and DocSettings.open then
                                     local ok_o, ds = pcall(DocSettings.open, DocSettings, fp)
                                     if ok_o and ds and ds.readSetting then
                                         local summary = ds:readSetting("summary")
                                         if type(summary) ~= "table" then summary = {} end
-                                        local current_pct = tonumber(ds:readSetting("percent_finished")) or 0
+                                        local current_pct = asFiniteNumber(ds:readSetting("percent_finished")) or 0
                                         if summary.status ~= "complete" or current_pct < 1.0 then
                                             summary.status = "complete"
                                             summary.modified = os.date("%Y-%m-%d")
@@ -637,11 +699,7 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
                                         end
                                     end
                                 end
-                                local ok_bl, BookList = pcall(require, "apps/filemanager/booklist")
-                                if ok_bl and BookList and BookList.setBookInfoCacheProperty then
-                                    pcall(BookList.setBookInfoCacheProperty, BookList, fp, "status", "complete")
-                                    pcall(BookList.setBookInfoCacheProperty, BookList, fp, "percent_finished", 1.0)
-                                end
+                                updateBookListCache(fp, "complete", 1.0)
                             end
                         end
                     end
@@ -688,21 +746,23 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
         end
     end
 
-    -- Read-Ahead Status Alignment against frontier DTO
+    -- Read-Ahead Status Alignment against frontier DTO (only when frontier has active reading/finished progress)
     local active_frontier = frontier_dto
     if not active_frontier and remote_records and #remote_records > 0 then
-        if remote_records[1] and remote_records[1].active_book then
+        if remote_records[1] and type(remote_records[1].active_book) == "table" and isActiveFrontierRecord(remote_records[1].active_book) then
             active_frontier = remote_records[1].active_book
-        elseif #remote_records == 1 and not (remote_records[1].is_folder or remote_records[1].kind == "folder") then
+        elseif #remote_records == 1 and isActiveFrontierRecord(remote_records[1]) then
             active_frontier = remote_records[1]
         elseif #remote_records > 1 then
             local highest_in_progress = nil
             local highest_ip_num = -1
             for _, r in ipairs(remote_records) do
-                if not (r.is_folder or r.kind == "folder") then
+                if type(r) == "table" and not (r.is_folder or r.kind == "folder") then
+                    local rp = type(r.komga_dto) == "table" and type(r.komga_dto.readProgress) == "table" and r.komga_dto.readProgress or nil
+                    local rpct = asFiniteNumber(r.percent_finished)
                     local is_reading = (r.status == "reading" or r.read_status == "reading")
-                        or (r.percent_finished and r.percent_finished > 0 and r.percent_finished < 1)
-                        or (r.komga_dto and r.komga_dto.readProgress and not r.komga_dto.readProgress.completed and (r.komga_dto.readProgress.page or 0) > 0)
+                        or (rpct and rpct > 0 and rpct < 1)
+                        or (rp and not rp.completed and (asFiniteNumber(rp.page) or 0) > 0)
                     if is_reading then
                         local n = M.extractChapterNumber(r) or -1
                         if n > highest_ip_num then
@@ -721,7 +781,7 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
     if active_frontier then
         for i = 1, #out do
             local item = out[i]
-            if item and not (item.is_folder or item.kind == "folder" or item.is_series) then
+            if item and not item.is_remote and not (item.is_folder or item.kind == "folder" or item.is_series) then
                 M.syncLocalChapterStatus(item, active_frontier)
             end
         end

@@ -27,19 +27,24 @@ M.clearSeriesFolderCache = M.clearSeriesCache
 M.clearRootCache = function() _active_root_cache = nil end
 
 function M.clearCachesForSeries(sid_str, title_key)
+    _active_root_cache = nil
     if not sid_str and not title_key then
         M.clearSeriesCache()
         return
     end
+    local sid_low = sid_str and tostring(sid_str):lower() or nil
+    local title_low = title_key and tostring(title_key):lower() or nil
     for k in pairs(_active_series_cache) do
         local ks = tostring(k):lower()
-        if (sid_str and ks:find(sid_str:lower(), 1, true)) or (title_key and ks:find(title_key:lower(), 1, true)) then
+        if (sid_low and (ks == sid_low or ks:find("|" .. sid_low .. "|", 1, true) or ks:find("/" .. sid_low, 1, true)))
+            or (title_low and ks:find(title_low, 1, true)) then
             _active_series_cache[k] = nil
         end
     end
     for k in pairs(_series_folder_cache) do
         local ks = tostring(k):lower()
-        if (sid_str and ks:find(sid_str:lower(), 1, true)) or (title_key and ks:find(title_key:lower(), 1, true)) then
+        if (sid_low and (ks == sid_low or ks:find("|" .. sid_low .. "|", 1, true)))
+            or (title_low and ks:find(title_low, 1, true)) then
             _series_folder_cache[k] = nil
         end
     end
@@ -68,10 +73,55 @@ local function liveModule(name)
     end
 end
 
+local function usableKomga(p)
+    return type(p) == "table" and p.settings and p.api and p.sync and p.cache and p or nil
+end
+
 local function getKomgaPlugin()
+    local live = liveModule("kokomga")
+    if usableKomga(live) then return live end
     local ok_p, PluginLoader = pcall(require, "pluginloader")
     local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
-    return loaded and loaded["kokomga"] or liveModule("kokomga")
+    local p = loaded and loaded["kokomga"]
+    return usableKomga(p) or live or p
+end
+
+local function isSafeAbsPath(p)
+    if type(p) ~= "string" or p == "" or p:find("%z") or not p:find("^/") then return false end
+    if p:find("/%.%./") or p:find("/%.%.$") or p:find("^%.%./") or p == ".." then return false end
+    return true
+end
+
+local function isPathWithinBase(cand, base)
+    if not isSafeAbsPath(cand) or not isSafeAbsPath(base) then return false end
+    local nc = cand:gsub("//+", "/"):gsub("/+$", "")
+    local nb = base:gsub("//+", "/"):gsub("/+$", "")
+    if nb == "" then return false end
+    return nc == nb or nc:sub(1, #nb + 1) == nb .. "/"
+end
+
+local function sanitizeFolderLabel(label)
+    if type(label) ~= "string" or label == "" then return nil end
+    if label:find("%z") or label:find("%.%.") or label:lower():find("%%2e%%2e") or label:match("^%.+$") then
+        return nil
+    end
+    local s = label:gsub('[/%\\%:%*%?%"%<%>%|]', '_')
+    if s == "" or s == "." or s == ".." then return nil end
+    return s
+end
+
+local function buildShelfCacheKey(source, extra)
+    source = type(source) == "table" and source or {}
+    local lib = source.library_id
+    if type(lib) == "table" then lib = table.concat(lib, ",") end
+    return table.concat({
+        tostring(source.remote_kind or ""),
+        tostring(source.remote_mode or "all"),
+        tostring(lib or ""),
+        tostring(source.local_folder or source.folder_path or source.path or ""),
+        tostring(source.opds_id or source.feed_url or ""),
+        tostring(extra or "root"),
+    }, "|")
 end
 
 local function getBridgePlugin()
@@ -421,7 +471,8 @@ local SPEC = {
     end,
 
     fetch = function(source, drill, offset, limit)
-        drill = drill or (source and source.drill)
+        source = type(source) == "table" and source or {}
+        drill = drill or source.drill
         debugLog(string.format("[FETCH ENTER] drill=%s id=%s label=%s off=%s lim=%s",
             tostring(drill and drill.kind),
             tostring(drill and (drill.series_id or drill.path or drill.feed_url)),
@@ -432,8 +483,8 @@ local SPEC = {
         local is_komga_series = drill and (drill.kind == "komga_series" or drill.kind == "series" or drill.series_id ~= nil or drill.komga_series_id ~= nil or (type(drill.path) == "string" and drill.path:find("^komga://series/")))
         local is_opds_series = drill and (drill.kind == "opds_nav" or drill.feed_url)
 
-        local root_cache_key = not drill and tostring(source and (source.folder_path or source.path or "root"))
-        local series_cache_key = (is_komga_series or is_opds_series) and tostring(drill.series_id or drill.komga_series_id or drill.path or drill.label or "")
+        local root_cache_key = not drill and buildShelfCacheKey(source, "root")
+        local series_cache_key = (is_komga_series or is_opds_series) and buildShelfCacheKey(source, tostring(drill.series_id or drill.komga_series_id or drill.path or drill.label or ""))
         local merged = nil
 
         if not drill then
@@ -449,10 +500,10 @@ local SPEC = {
 
         if not merged then
             local folder_path
-            if drill and type(drill.path) == "string" and drill.path:find("^/") then
+            if drill and isSafeAbsPath(drill.path) then
                 folder_path = drill.path
             elseif (is_komga_series or is_opds_series) and drill and drill.label then
-            local cache_key = tostring(drill.series_id or drill.label)
+            local cache_key = buildShelfCacheKey(source, tostring(drill.series_id or drill.label))
             local cached_entry = _series_folder_cache and _series_folder_cache[cache_key]
             local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
             if cached_entry and cached_entry.path then
@@ -467,8 +518,9 @@ local SPEC = {
                 local ok_fp, fp_err = pcall(function()
                     local base_dirs = {}
                     local function add_base(dir)
-                        if dir and type(dir) == "string" and dir ~= "" then
+                        if isSafeAbsPath(dir) then
                             local clean = dir:gsub("/+$", "")
+                            if clean == "" then return end -- never probe filesystem root "/"
                             for _, b in ipairs(base_dirs) do
                                 if b == clean then return end
                             end
@@ -498,35 +550,37 @@ local SPEC = {
                     add_base(G_reader_settings and G_reader_settings:readSetting("home_dir"))
 
                     local series_label = drill.label or ""
-                    if #base_dirs > 0 and series_label ~= "" and ok_lfs and lfs and lfs.attributes then
-                        local sanitized_label = series_label:gsub('[/%\\%:%*%?%"%<%>%|]', '_')
+                    local sanitized_label = sanitizeFolderLabel(series_label)
+                    if #base_dirs > 0 and sanitized_label and ok_lfs and lfs and lfs.attributes then
                         local title_key = Dedup.nameKey(series_label)
 
                         for _, base_path in ipairs(base_dirs) do
-                            -- 1. Direct label
-                            local direct = base_path .. "/" .. series_label
-                            if lfs.attributes(direct, "mode") == "directory" then
-                                folder_path = direct
-                                break
+                            -- 1. Direct label (only when label has no path separators or traversal)
+                            if not series_label:find("[/\\]") and not series_label:find("%.%.") and not series_label:find("%z") then
+                                local direct = base_path .. "/" .. series_label
+                                if isPathWithinBase(direct, base_path) and lfs.attributes(direct, "mode") == "directory" then
+                                    folder_path = direct
+                                    break
+                                end
                             end
 
                             -- 2. Kokomga sanitized label
                             if sanitized_label ~= series_label then
                                 local sanitized_path = base_path .. "/" .. sanitized_label
-                                if lfs.attributes(sanitized_path, "mode") == "directory" then
+                                if isPathWithinBase(sanitized_path, base_path) and lfs.attributes(sanitized_path, "mode") == "directory" then
                                     folder_path = sanitized_path
                                     break
                                 end
                             end
 
-                            -- 3. Fuzzy directory scan
+                            -- 3. Fuzzy directory scan (preserve lfs.dir iterator + dir_obj state)
                             if title_key and lfs.dir then
-                                local ok_d, iter = pcall(lfs.dir, base_path)
+                                local ok_d, iter, dir_obj = pcall(lfs.dir, base_path)
                                 if ok_d and iter then
-                                    for entry in iter do
+                                    for entry in iter, dir_obj do
                                         if entry ~= "." and entry ~= ".." then
                                             local full = base_path .. "/" .. entry
-                                            if lfs.attributes(full, "mode") == "directory" then
+                                            if isPathWithinBase(full, base_path) and lfs.attributes(full, "mode") == "directory" then
                                                 if Dedup.nameKeysMatch(Dedup.nameKey(entry), title_key) then
                                                     folder_path = full
                                                     break
@@ -534,6 +588,8 @@ local SPEC = {
                                             end
                                         end
                                     end
+                                elseif not ok_d then
+                                    logger.warn("[Hybrid] lfs.dir failed for " .. tostring(base_path) .. ": " .. tostring(iter))
                                 end
                             end
 
@@ -541,6 +597,9 @@ local SPEC = {
                         end
                     end
                 end)
+                if not ok_fp then
+                    logger.warn("[Hybrid] series folder scan error: " .. tostring(fp_err))
+                end
 
                 if _series_folder_cache then
                     _series_folder_cache[cache_key] = { path = folder_path or false, time = os.time() }
@@ -661,11 +720,11 @@ local SPEC = {
         end
 
         -- 2. Fetch all remote records
-        local remote_books, _
+        local remote_books, _remote_total
         if is_komga_series or is_opds_series then
-            remote_books, _ = Remote.fetchRemote(source, nil, drill, is_spine)
+            remote_books, _remote_total = Remote.fetchRemote(source, nil, drill, is_spine)
         else
-            remote_books, _ = Remote.fetchRemote(source, folder_path, drill, false)
+            remote_books, _remote_total = Remote.fetchRemote(source, folder_path, drill, false)
         end
         remote_books = remote_books or {}
 
@@ -689,8 +748,8 @@ local SPEC = {
             merged = Dedup.mergeRecords(local_books, remote_books)
         end
 
-        -- Ghost series detection: if drilled into a series with 0 local books and 0 remote books while online
-        if is_komga_series and #local_books == 0 and #remote_books == 0 and drill then
+        -- Ghost series detection: skip in next_book mode (empty active book is normal for finished/unread series)
+        if is_komga_series and source.remote_mode ~= "next_book" and #local_books == 0 and #remote_books == 0 and drill then
             local sid = drill.series_id or drill.komga_series_id
             local s_label = drill.label or drill.title
             local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
@@ -706,15 +765,20 @@ local SPEC = {
                 if ok_ui and UIManager and ok_notif and Notification then
                     UIManager:show(Notification:new{ text = _("Series no longer exists on Komga; returning to shelf.") })
                 end
-                -- Auto-eject: pop back to root shelf if currently drilled in
-                for _, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
-                    local ok_m, m = pcall(require, mod)
-                    local bw = ok_m and m and m.instance and m.instance.bookshelf
-                    if bw and bw._drilldown_path and #bw._drilldown_path > 0 then
-                        bw:_drillBackTo(0)
-                        break
-                    end
+                -- Auto-eject asynchronously via nextTick so we do not re-enter _rebuild mid-fetch
+                if ok_ui and UIManager and UIManager.nextTick then
+                    UIManager:nextTick(function()
+                        for _, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
+                            local ok_m, m = pcall(require, mod)
+                            local bw = ok_m and m and m.instance and m.instance.bookshelf
+                            if bw and bw._drilldown_path and #bw._drilldown_path > 0 then
+                                bw:_drillBackTo(0)
+                                break
+                            end
+                        end
+                    end)
                 end
+                return {}, 0
             end
         end
 
@@ -753,7 +817,8 @@ local SPEC = {
 
                 for i = 1, #merged do
                     local entry = merged[i]
-                    if entry.is_folder or entry.kind == "folder" or entry.is_series or entry.komga_series_id or (type(entry.path) == "string" and entry.path:find("^komga://series/")) then
+                    local is_entry_book = entry.komga_book_id ~= nil or entry.kind == "book"
+                    if not is_entry_book and (entry.is_folder or entry.kind == "folder" or entry.is_series or entry.komga_series_id or (type(entry.path) == "string" and entry.path:find("^komga://series/"))) then
                         local books = Remote.expandSeriesToBooks(source, entry, sort_priority, folder_path)
                         for _, b in ipairs(books) do
                             local k = spineKey(b)
@@ -803,30 +868,39 @@ local SPEC = {
         local ok_se, SortEngine = pcall(require, "lib/bookshelf_sort_engine")
         if is_komga_series or is_opds_series then
             -- Series natural reading order: series_index / series_num numerical sort, then natural title/filename
-            table.sort(merged, function(a, b)
+            local ok_s, s_err = pcall(table.sort, merged, function(a, b)
                 local na = tonumber(a.series_index or a.series_num)
                 local nb = tonumber(b.series_index or b.series_num)
-                if na and nb and na ~= nb then
+                if na and na == na and nb and nb == nb and na ~= nb then
                     return na < nb
                 end
-                if na and not nb then return true end
-                if nb and not na then return false end
+                if na and na == na and not (nb and nb == nb) then return true end
+                if nb and nb == nb and not (na and na == na) then return false end
                 if ok_se and SortEngine and SortEngine.KEYS and SortEngine.KEYS.filename then
                     local res = SortEngine.KEYS.filename.comparator(a, b)
-                    if res ~= 0 then return res < 0 end
+                    if type(res) == "number" and res ~= 0 then
+                        return res < 0
+                    elseif res == "__sort_to_end__" then
+                        return false
+                    elseif res == "__sort_to_start__" then
+                        return true
+                    end
                 end
                 local ta = a.title or a.display_title or a.filename or a.name or ""
                 local tb = b.title or b.display_title or b.filename or b.name or ""
                 return tostring(ta):lower() < tostring(tb):lower()
             end)
+            if not ok_s then
+                logger.warn("[Hybrid] series table.sort failed: " .. tostring(s_err))
+            end
         elseif is_spine then
             -- Spines mode: sections stay grouped, books are ordered within their section
             -- (mirroring Repo.getFolderSections). No cross-section reordering.
         elseif ok_se and SortEngine and SortEngine.chainedComparator and sort_priority and #sort_priority > 0 then
             local ok_s = pcall(table.sort, merged, SortEngine.chainedComparator(sort_priority))
             if not ok_s then
-                table.sort(merged, function(a, b)
-                    return (a.title or a.name or "") < (b.title or b.name or "")
+                pcall(table.sort, merged, function(a, b)
+                    return tostring(a.title or a.name or "") < tostring(b.title or b.name or "")
                 end)
             end
         end
@@ -852,20 +926,26 @@ local SPEC = {
         for i = off + 1, math.min(off + lim, total) do
             local rec = merged[i]
             if not rec.cover_image_path then
-                if rec.is_folder or rec.is_opds_nav or rec.komga_series_id then
+                local is_rec_book = rec.komga_book_id ~= nil or rec.kind == "book"
+                if not is_rec_book and (rec.is_folder or rec.is_opds_nav or rec.komga_series_id) then
                     local sid = rec.komga_series_id or (type(rec.filepath) == "string" and rec.filepath:match("^komga://series/(.+)$"))
                     local cp = sid and Remote.getKomgaCoverPath("series", sid, rec.title or rec.label)
                     if cp then
                         rec.cover_image_path = cp
                         rec.has_cover = true
-                        rec.first_book = {
-                            filepath = rec.filepath,
-                            cover_image_path = cp,
-                            title = rec.title,
-                            has_cover = true,
-                        }
+                        if type(rec.first_book) == "table" then
+                            rec.first_book.cover_image_path = cp
+                            rec.first_book.has_cover = true
+                        else
+                            rec.first_book = {
+                                filepath = rec.filepath,
+                                cover_image_path = cp,
+                                title = rec.title,
+                                has_cover = true,
+                            }
+                        end
                     end
-                elseif rec.komga_book_id or rec.komga_id then
+                elseif rec.komga_book_id or rec.komga_id or (type(rec.filepath) == "string" and rec.filepath:find("^komga://book/")) then
                     local bid = rec.komga_book_id or rec.komga_id or (type(rec.filepath) == "string" and rec.filepath:match("^komga://book/(.+)$"))
                     local cp = bid and Remote.getKomgaCoverPath("book", bid)
                     if cp then
@@ -922,14 +1002,17 @@ local SPEC = {
                             ok_det, s_det, err_det = pcall(api.get_books_for_series, api, series_id, nil, 0, 1)
                         end
                         local is_404 = false
-                        if type(s_det) == "table" then
-                            if s_det.code == 404 or (type(s_det.status) == "string" and s_det.status:find("404")) then
+                        if ok_det and type(s_det) == "table" then
+                            if s_det.code == 404 or tonumber(s_det.status) == 404
+                                or (type(s_det.status) == "string" and s_det.status:find("404", 1, true))
+                                or (type(s_det.error) == "string" and s_det.error:lower() == "not found") then
                                 is_404 = true
                             end
-                        elseif err_det and (tostring(err_det):find("404") or tostring(err_det):lower():find("not found")) then
+                        elseif ok_det and err_det and (tostring(err_det):find("404", 1, true) or tostring(err_det):lower():find("not found", 1, true)) then
                             is_404 = true
-                        elseif ok_det and s_det == nil then
-                            is_404 = true
+                        elseif not ok_det or err_det then
+                            logger.warn(string.format("[Hybrid] open_folder: transient Komga check error for %s: %s",
+                                tostring(series_id), tostring(not ok_det and s_det or err_det)))
                         end
                         if is_404 then
                             logger.warn(string.format("[Hybrid] open_folder: Series %s (%s) no longer exists on Komga (404), blocking drilldown and purging cache",
@@ -984,16 +1067,15 @@ local SPEC = {
             }
         end
 
-        -- 3. OPDS navigation tile
-        if folder.is_opds_nav or (folder.opds and folder.opds.feed_url) then
-            local fu = folder.opds and folder.opds.feed_url
-            local sk = (folder.opds and folder.opds.server_key) or folder.server_key
-            if not sk then
-                local ok_os, OpdsSource = pcall(require, "lib/bookshelf_opds_source")
-                if ok_os and OpdsSource and OpdsSource.serverKey and fu then
-                    sk = OpdsSource.serverKey(fu)
-                end
+        -- 3. OPDS navigation tile (never synthesize server_key by hashing child feed_url)
+        if folder.is_opds_nav or (type(folder.opds) == "table" and folder.opds.feed_url) then
+            local fu = type(folder.opds) == "table" and folder.opds.feed_url or nil
+            if type(fu) ~= "string" or not fu:lower():match("^https?://") then
+                logger.warn("[Hybrid] open_folder: rejected non-HTTP OPDS feed_url: " .. tostring(fu))
+                return nil
             end
+            local fp_sk = type(folder.filepath) == "string" and folder.filepath:match("^OPDS://([^/]+)/") or nil
+            local sk = fp_sk or (type(folder.opds) == "table" and folder.opds.server_key) or folder.server_key
             return {
                 kind = "opds_nav",
                 feed_url = fu,
@@ -1021,10 +1103,11 @@ local SPEC = {
     end,
 
     open = function(book, ctx)
-        local fp = book and book.filepath
-        if fp and not fp:find("^komga://") and not fp:find("^OPDS://") then
+        if type(book) ~= "table" then return false end
+        local fp = book.filepath
+        if isSafeAbsPath(fp) then
             local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-            if ok_lfs and lfs and lfs.attributes(fp, "mode") == "file" then
+            if ok_lfs and lfs and lfs.attributes and lfs.attributes(fp, "mode") == "file" then
                 return fp
             end
         end
@@ -1032,21 +1115,31 @@ local SPEC = {
         -- Check downloaded mapping
         local downloaded = Dedup.getDownloadedMap()
         local local_path = fp and downloaded[fp]
-        if local_path then
+        if isSafeAbsPath(local_path) then
             local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-            if ok_lfs and lfs and lfs.attributes(local_path, "mode") == "file" then
+            if ok_lfs and lfs and lfs.attributes and lfs.attributes(local_path, "mode") == "file" then
                 return local_path
             end
         end
 
         -- Remote open / download
         local komga = getKomgaPlugin()
-        if book.komga_id and komga and komga.downloadBookById then
+        local bid = book.komga_book_id or book.komga_id
+        if bid and komga and komga.downloadBookById then
             UIManager:show(Notification:new{ text = _("Downloading from Komga…") })
-            komga:downloadBookById(book.komga_id, function(path)
+            komga:downloadBookById(bid, function(path)
+                if Remote and Remote.registerDownloadedBook then Remote.registerDownloadedBook(book, path) end
                 if ctx and ctx.open and path then
                     ctx.open(path)
                 end
+            end, function(err)
+                UIManager:show(Notification:new{ text = _("Download failed: ") .. tostring(err) })
+            end)
+            return true
+        elseif bid and Remote and Remote.downloadKomgaBook then
+            UIManager:show(Notification:new{ text = _("Downloading from Komga…") })
+            Remote.downloadKomgaBook(book, nil, function(path)
+                if ctx and ctx.open and path then ctx.open(path) end
             end, function(err)
                 UIManager:show(Notification:new{ text = _("Download failed: ") .. tostring(err) })
             end)
@@ -1068,23 +1161,37 @@ local SPEC = {
     end,
 
     info = function(book, ctx)
+        if type(book) ~= "table" then return end
         local ok_i, Info = pcall(require, "lib/bookshelf_book_info")
         if ok_i and Info and Info.show then
             Info.show(book, ctx)
         else
+            local auth = book.authors
+            if type(auth) == "table" then
+                auth = table.concat(auth, ", ")
+            end
             UIManager:show(Notification:new{
-                text = (book.title or _("Book")) .. "\n" .. (book.authors or book.author or ""),
+                text = tostring(book.title or _("Book")) .. "\n" .. tostring(auth or book.author or ""),
             })
         end
     end,
 
     refresh = function(source, drill, done)
-        _active_root_cache = nil
+        source = type(source) == "table" and source or {}
+        M.clearSeriesCache()
+        if Dedup and Dedup.invalidateDownloadedMap then Dedup.invalidateDownloadedMap() end
+        local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
+        if ok_r and Repo and Repo.invalidateWalkCache then pcall(Repo.invalidateWalkCache) end
+
         local remote_kind = source.remote_kind or (source.opds_id and "opds") or "komga"
         if remote_kind == "opds" then
             local ok_w, OpdsWindow = pcall(require, "lib/bookshelf_opds_window")
-            if ok_w and OpdsWindow and OpdsWindow.invalidate then
-                OpdsWindow.invalidate(source.opds_id, source.feed_url)
+            if ok_w and OpdsWindow then
+                if OpdsWindow.reset then
+                    pcall(OpdsWindow.reset, source.opds_id, source.feed_url)
+                elseif OpdsWindow.invalidate then
+                    pcall(OpdsWindow.invalidate, source.opds_id, source.feed_url)
+                end
             end
             if done then done() end
         else
@@ -1096,7 +1203,7 @@ local SPEC = {
             if not reachable then
                 logger.info("[Hybrid] refresh: server unreachable (" .. tostring(reach_reason) .. "), serving cached books")
                 -- Do not wipe disk caches when offline. Refresh simply serves cached records.
-                if source and source.remote_mode == "next_book" then
+                if source.remote_mode == "next_book" then
                     Remote.getActiveQueue(source)
                 elseif drill and (drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/"))) then
                     Remote.getKomgaRecords(source, drill)
@@ -1112,34 +1219,41 @@ local SPEC = {
                 return
             end
 
-            if source and source.remote_mode == "next_book" then
+            if source.remote_mode == "next_book" then
                 pcall(function()
                     local DataStorage = require("datastorage")
                     local LuaSettings = require("luasettings")
                     local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
                     if s then
-                        local lists = s:readSetting("lists") or {}
-                        lists["active_queue"] = nil
-                        s:saveSetting("lists", lists)
-                        s:flush()
+                        local lists = s:readSetting("lists")
+                        if type(lists) == "table" then
+                            lists["active_queue"] = nil
+                            s:saveSetting("lists", lists)
+                            s:flush()
+                        end
                     end
                 end)
                 Remote.getActiveQueue(source)
                 if done then done() end
             else
                 if drill and (drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/"))) then
-                    local sid = tostring(drill.series_id or drill.komga_series_id or drill.path:match("^komga://series/(.+)$"))
-                    pcall(function()
-                        local DataStorage = require("datastorage")
-                        local LuaSettings = require("luasettings")
-                        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-                        if s then
-                            local entries = s:readSetting("series") or {}
-                            entries[sid] = nil
-                            s:saveSetting("series", entries)
-                            s:flush()
-                        end
-                    end)
+                    local sid = drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:match("^komga://series/(.+)$"))
+                    if sid and sid ~= "" then
+                        sid = tostring(sid)
+                        pcall(function()
+                            local DataStorage = require("datastorage")
+                            local LuaSettings = require("luasettings")
+                            local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+                            if s then
+                                local entries = s:readSetting("series")
+                                if type(entries) == "table" then
+                                    entries[sid] = nil
+                                    s:saveSetting("series", entries)
+                                    s:flush()
+                                end
+                            end
+                        end)
+                    end
                     Remote.getKomgaRecords(source, drill)
                 else
                     Remote.getAllSeriesRecords(source, false, true)
@@ -1151,9 +1265,11 @@ local SPEC = {
 
     owns = function(book)
         if type(book) ~= "table" then return false end
-        return book.source_kind == "hybrid"
-            or book.is_komga == true
-            or (book.filepath and (book.filepath:find("^komga://") or book.filepath:find("^OPDS://")))
+        if book.source_kind ~= nil then
+            return book.source_kind == "hybrid"
+        end
+        return book.is_komga == true
+            or (type(book.filepath) == "string" and (book.filepath:find("^komga://") ~= nil or book.filepath:find("^OPDS://") ~= nil))
     end,
 }
 
