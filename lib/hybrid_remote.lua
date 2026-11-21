@@ -7,6 +7,228 @@ local Dedup = require("lib/hybrid_dedup")
 local M = {}
 
 -- ---------------------------------------------------------------------------
+-- Shared Safety, Validation, Format & Atomic I/O Helpers
+-- ---------------------------------------------------------------------------
+
+local DEFAULT_MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024 -- 1 GiB
+
+local function sanitizeLog(val)
+    if val == nil then return "nil" end
+    return tostring(val):gsub("[%z\r\n]+", " ")
+end
+
+local function safeCall(context, fn, ...)
+    local ok, r1, r2, r3, r4 = pcall(fn, ...)
+    if not ok then
+        logger.warn(string.format("[Hybrid] %s failed: %s", sanitizeLog(context), sanitizeLog(r1)))
+        return false, r1
+    end
+    return true, r1, r2, r3, r4
+end
+
+local function asTable(v) return type(v) == "table" and v or nil end
+local function asString(v) return type(v) == "string" and v or nil end
+local function asNumber(v)
+    if type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge then
+        return v
+    end
+    return nil
+end
+local function asScalar(v)
+    return asString(v) or asNumber(v)
+end
+
+local function copyTableShallow(t)
+    local out = {}
+    if type(t) == "table" then
+        for k, v in pairs(t) do out[k] = v end
+    end
+    return out
+end
+
+local function validateKomgaId(raw_id)
+    if raw_id == nil then return nil end
+    local t = type(raw_id)
+    local s
+    if t == "string" then
+        s = raw_id
+    elseif t == "number" and asNumber(raw_id) and math.floor(raw_id) == raw_id then
+        s = tostring(raw_id)
+    else
+        return nil
+    end
+    if s == "" or #s > 128 or not s:match("^[%w%-_]+$") then
+        return nil
+    end
+    return s
+end
+
+local function validateTypeLabel(label)
+    if label == "series" or label == "book" then
+        return label
+    end
+    return nil
+end
+
+local function sanitizePathComponent(raw, fallback)
+    if type(raw) ~= "string" or raw == "" then return fallback end
+    if raw:find("%z") or raw:find("%.%.") or raw:lower():find("%%2e%%2e") or raw:match("^%.+$") then
+        return fallback
+    end
+    local clean = raw:gsub("[/\\?%%*:|\"<>]", "_"):gsub("%z", ""):gsub("^%.+", "_"):gsub("%.%.+", "_")
+    if clean == "" or clean == "_" or clean == "." or clean == ".." then
+        return fallback
+    end
+    return clean
+end
+
+local function normalizeAbsPath(p)
+    if type(p) ~= "string" or p == "" or p:find("%z") then return nil end
+    if p:find("/%.%./") or p:find("/%.%.$") or p:find("^%.%./") or p == ".." then
+        return nil
+    end
+    local norm = p:gsub("//+", "/")
+    if #norm > 1 then norm = norm:gsub("/+$", "") end
+    return norm
+end
+
+local function isPathWithinRoot(candidate_path, root_dir)
+    local norm_cand = normalizeAbsPath(candidate_path)
+    local norm_root = normalizeAbsPath(root_dir)
+    if not norm_cand or not norm_root then return false end
+    if norm_cand == norm_root then return true end
+    return norm_cand:sub(1, #norm_root + 1) == norm_root .. "/"
+end
+
+local function parseHttpUrl(url)
+    if type(url) ~= "string" or url == "" or url:find("[%z\r\n]") then return nil end
+    local scheme, rest = url:match("^([%a][%w+.-]*)://(.+)$")
+    if not scheme then return nil end
+    scheme = scheme:lower()
+    if scheme ~= "http" and scheme ~= "https" then return nil end
+    local authority = rest:match("^([^/?#]+)")
+    if not authority or authority == "" then return nil end
+    -- Strip optional userinfo
+    local hostport = authority:match("@(.+)$") or authority
+    local host, port_str
+    if hostport:sub(1, 1) == "[" then
+        host, port_str = hostport:match("^(%b[]):?(%d*)$")
+    else
+        host, port_str = hostport:match("^([^:]+):?(%d*)$")
+    end
+    if not host or host == "" then return nil end
+    local port = tonumber(port_str) or (scheme == "https" and 443 or 80)
+    return { scheme = scheme, host = host:lower(), port = port }
+end
+
+local function isAllowedHttpUrl(url)
+    return parseHttpUrl(url) ~= nil
+end
+
+local function isSameHost(url_a, url_b)
+    local a = parseHttpUrl(url_a)
+    local b = parseHttpUrl(url_b)
+    if not (a and b) then return false end
+    return a.host == b.host
+end
+
+local function isSameOriginForAuth(target_url, base_url)
+    local t = parseHttpUrl(target_url)
+    local b = parseHttpUrl(base_url)
+    if not (t and b) then return false end
+    if b.scheme == "https" and t.scheme ~= "https" then return false end
+    return t.scheme == b.scheme and t.host == b.host and t.port == b.port
+end
+
+local FORMATS = {
+    ["application/zip"] = "CBZ",
+    ["application/x-cbz"] = "CBZ",
+    ["application/x-zip-compressed"] = "CBZ",
+    ["application/epub+zip"] = "EPUB",
+    ["application/pdf"] = "PDF",
+    ["application/x-cbr"] = "CBR",
+    ["application/x-rar-compressed"] = "CBR",
+    ["application/x-rar"] = "CBR",
+}
+
+local function deriveFormat(media_type, filename, title)
+    if media_type and FORMATS[media_type] then
+        return FORMATS[media_type]
+    end
+    for _, str in ipairs({ filename, title }) do
+        if type(str) == "string" then
+            local ext = str:match("%.([a-zA-Z0-9]+)$")
+            if ext then
+                local u = ext:upper()
+                if u == "CBZ" or u == "ZIP" then return "CBZ" end
+                if u == "CBR" or u == "RAR" then return "CBR" end
+                if u == "EPUB" then return "EPUB" end
+                if u == "PDF" then return "PDF" end
+                if u == "MOBI" or u == "AZW3" or u == "FB2" or u == "TXT" then return u end
+            end
+        end
+    end
+    return "CBZ"
+end
+
+local function copyFileChunked(src_path, dst_path, chunk_size)
+    chunk_size = chunk_size or 65536
+    local rf, rerr = io.open(src_path, "rb")
+    if not rf then return false, "Failed to open source: " .. tostring(rerr) end
+    local wf, werr = io.open(dst_path, "wb")
+    if not wf then
+        pcall(rf.close, rf)
+        return false, "Failed to open destination: " .. tostring(werr)
+    end
+    local copy_ok = true
+    local copy_err = nil
+    while true do
+        local chunk = rf:read(chunk_size)
+        if not chunk then break end
+        local ok_w, err_w = wf:write(chunk)
+        if not ok_w then
+            copy_ok = false
+            copy_err = "Write failed: " .. tostring(err_w)
+            break
+        end
+    end
+    pcall(rf.close, rf)
+    local ok_c, err_c = wf:close()
+    if copy_ok and not ok_c then
+        copy_ok = false
+        copy_err = "Close failed: " .. tostring(err_c)
+    end
+    if not copy_ok then
+        pcall(os.remove, dst_path)
+        return false, copy_err
+    end
+    return true
+end
+
+local function resolveCaBundle()
+    local candidates = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/cert.pem",
+        "/system/etc/security/cacerts",
+    }
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    if ok_ds and DataStorage and DataStorage.getDataDir then
+        local dd = DataStorage:getDataDir()
+        if type(dd) == "string" and dd ~= "" then
+            table.insert(candidates, 1, dd .. "/data/ca-bundle.crt")
+        end
+    end
+    for _, path in ipairs(candidates) do
+        local f = io.open(path, "rb")
+        if f then
+            f:close()
+            return path
+        end
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
 -- OPDS Provider
 -- ---------------------------------------------------------------------------
 
@@ -132,10 +354,11 @@ end
 
 local function getUpvalueByName(fn, target_name)
     if type(fn) ~= "function" then return nil end
+    if type(debug) ~= "table" or type(debug.getupvalue) ~= "function" then return nil end
     local i = 1
     while true do
-        local name, val = debug.getupvalue(fn, i)
-        if not name then break end
+        local ok, name, val = pcall(debug.getupvalue, fn, i)
+        if not ok or not name then break end
         if name == target_name then return val end
         i = i + 1
     end
@@ -223,15 +446,10 @@ end
 
 M.ensureKomgaApiPatched = ensureKomgaApiPatched
 
-local function asTable(v) return type(v) == "table" and v or nil end
-local function asString(v) return type(v) == "string" and v or nil end
-local function asNumber(v) return type(v) == "number" and v or nil end
-local function asScalar(v)
-    local t = type(v)
-    if t == "string" or t == "number" then return v end
-end
-
 local function trimBook(book)
+    if type(book) ~= "table" then return nil end
+    local valid_id = validateKomgaId(book.id)
+    if not valid_id then return nil end
     local md = asTable(book.metadata) or {}
     local media = asTable(book.media) or {}
     local progress = asTable(book.readProgress)
@@ -244,9 +462,9 @@ local function trimBook(book)
         end
     end
     return {
-        id = asString(book.id),
+        id = valid_id,
         name = asString(book.name),
-        seriesId = asString(book.seriesId),
+        seriesId = validateKomgaId(book.seriesId),
         seriesTitle = asString(book.seriesTitle),
         oneshot = book.oneshot == true,
         lastModified = asString(book.lastModified),
@@ -278,9 +496,12 @@ local function trimBooks(content, limit)
 end
 
 local function trimSeries(series)
+    if type(series) ~= "table" then return nil end
+    local valid_id = validateKomgaId(series.id)
+    if not valid_id then return nil end
     local md = asTable(series.metadata) or {}
     return {
-        id = asString(series.id),
+        id = valid_id,
         title = asString(md.title) or asString(series.name),
         summary = asString(md.summary),
         lastModified = asString(series.lastModified),
@@ -300,19 +521,23 @@ local function seriesStatus(dto)
 end
 
 local function createKomgaApiFallback()
-    local DataStorage = require("datastorage")
-    local LuaSettings = require("luasettings")
-    local ok_s_file, s = pcall(LuaSettings.open, LuaSettings, DataStorage:getSettingsDir() .. "/kokomga.lua")
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    local ok_ls, LuaSettings = pcall(require, "luasettings")
+    if not (ok_ds and DataStorage and ok_ls and LuaSettings) then return nil end
+    local ok_s_file, s = safeCall("createKomgaApiFallback.open", LuaSettings.open, LuaSettings, DataStorage:getSettingsDir() .. "/kokomga.lua")
     local url = ok_s_file and s and s:readSetting("server_url")
     local key = ok_s_file and s and s:readSetting("api_key")
     local auth_h = ok_s_file and s and s:readSetting("auth_header")
-    if url and url ~= "" and ((key and key ~= "") or (auth_h and auth_h ~= "")) then
-        pcall(require, "kokomga/core/api")
-        pcall(require, "plugins/kokomga.koplugin/core/api")
-        pcall(require, "core/api")
-        for k, v in pairs(package.loaded) do
-            if type(k) == "string" and k:find("core/api") and type(v) == "table" and v.new then
-                local ok_a, new_api = pcall(v.new, v, url, key or "")
+    if isAllowedHttpUrl(url) and ((key and key ~= "") or (auth_h and auth_h ~= "")) then
+        local candidates = {
+            "kokomga/core/api",
+            "plugins/kokomga.koplugin/core/api",
+            "core/api",
+        }
+        for _, mod_name in ipairs(candidates) do
+            local ok_m, api_cls = pcall(require, mod_name)
+            if ok_m and type(api_cls) == "table" and type(api_cls.new) == "function" then
+                local ok_a, new_api = safeCall("createKomgaApiFallback.new", api_cls.new, api_cls, url, key or "")
                 if ok_a and new_api then
                     if auth_h and auth_h ~= "" then new_api.auth_header = auth_h end
                     patchApiTable(new_api)
@@ -362,14 +587,20 @@ end
 
 function M.purgeDeletedSeries(series_id, series_title)
     if not series_id and not series_title then return false end
+    local sid_str = series_id and validateKomgaId(series_id) or nil
+    if series_id and not sid_str then
+        logger.warn("[Hybrid] purgeDeletedSeries rejected invalid series_id: " .. sanitizeLog(series_id))
+        return false, "invalid_series_id"
+    end
     _mem_all_series = {}
-    local sid_str = series_id and tostring(series_id) or nil
     local title_key = series_title and Dedup.nameKey(series_title) or nil
 
-    logger.info(string.format("[Hybrid] Purging deleted series from caches: id=%s title=%s", tostring(sid_str), tostring(series_title)))
+    logger.info(string.format("[Hybrid] Purging deleted series from caches: id=%s title=%s", sanitizeLog(sid_str), sanitizeLog(series_title)))
 
     -- 1. Persistent cache in kokomga_bookshelf.lua
-    pcall(function()
+    local flush_ok = true
+    local flush_err = nil
+    local ok_persist, err_persist = safeCall("purgeDeletedSeries.persist", function()
         local DataStorage = require("datastorage")
         local LuaSettings = require("luasettings")
         local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
@@ -518,7 +749,11 @@ function M.purgeDeletedSeries(series_id, series_title)
         end
 
         if modified then
-            s:flush()
+            local ok_f, err_f = s:flush()
+            if ok_f == false then
+                flush_ok = false
+                flush_err = err_f or "flush failed"
+            end
         end
     end)
 
@@ -533,12 +768,27 @@ function M.purgeDeletedSeries(series_id, series_title)
     end
     M.clearCoverPathCache()
 
-    -- 3. Cover files on disk
+    -- 3. Cover files on disk (aligned with DataStorage:getDataDir()/komga_covers)
     if sid_str then
-        pcall(function()
+        safeCall("purgeDeletedSeries.removeCovers", function()
             local DataStorage = require("datastorage")
-            local cover_dir = DataStorage:getSettingsDir() .. "/cache/komga_covers"
-            os.remove(cover_dir .. "/series_" .. sid_str .. ".jpg")
+            local dirs = {}
+            if DataStorage and DataStorage.getDataDir then
+                local dd = DataStorage:getDataDir()
+                if dd then dirs[#dirs + 1] = dd .. "/komga_covers" end
+            end
+            if DataStorage and DataStorage.getSettingsDir then
+                local sd = DataStorage:getSettingsDir()
+                if sd then dirs[#dirs + 1] = sd .. "/cache/komga_covers" end
+            end
+            for _, cover_dir in ipairs(dirs) do
+                for _, ext in ipairs({ ".jpg", ".jpeg", ".png" }) do
+                    local target = cover_dir .. "/series_" .. sid_str .. ext
+                    if isPathWithinRoot(target, cover_dir) then
+                        os.remove(target)
+                    end
+                end
+            end
         end)
     end
 
@@ -554,6 +804,12 @@ function M.purgeDeletedSeries(series_id, series_title)
         Sources.changed("hybrid")
     end
 
+    if not ok_persist then
+        return false, err_persist
+    end
+    if not flush_ok then
+        return false, flush_err
+    end
     return true
 end
 
@@ -563,8 +819,8 @@ function M.lookupSeriesIdByTitle(title)
     if not title_key then return nil end
 
     if not _series_title_to_id then
-        _series_title_to_id = {}
-        pcall(function()
+        local loaded_map = {}
+        local ok_load = safeCall("lookupSeriesIdByTitle.load", function()
             local DataStorage = require("datastorage")
             local LuaSettings = require("luasettings")
             local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
@@ -574,10 +830,11 @@ function M.lookupSeriesIdByTitle(title)
                     local items = page and page.items
                     if items then
                         for _, item in ipairs(items) do
-                            if item.id and item.title then
+                            local valid_id = item and validateKomgaId(item.id)
+                            if valid_id and item.title then
                                 local k = Dedup.nameKey(item.title)
-                                if k and not _series_title_to_id[k] then
-                                    _series_title_to_id[k] = tostring(item.id)
+                                if k and not loaded_map[k] then
+                                    loaded_map[k] = valid_id
                                 end
                             end
                         end
@@ -585,6 +842,10 @@ function M.lookupSeriesIdByTitle(title)
                 end
             end
         end)
+        if not ok_load then
+            return nil
+        end
+        _series_title_to_id = loaded_map
     end
 
     if _series_title_to_id[title_key] then
@@ -601,7 +862,15 @@ function M.lookupSeriesIdByTitle(title)
 end
 
 function M.getKomgaCoverPath(type_label, id, title, fallback_id)
+    type_label = validateTypeLabel(type_label)
     if not type_label then return nil end
+    if id ~= nil then
+        id = validateKomgaId(id)
+        if not id then return nil end
+    end
+    if fallback_id ~= nil then
+        fallback_id = validateKomgaId(fallback_id)
+    end
     if not id and type_label == "series" and title then
         id = M.lookupSeriesIdByTitle(title)
     end
@@ -770,73 +1039,51 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
 end
 local getKomgaCoverPath = M.getKomgaCoverPath
 
-local FORMATS = {
-    ["application/zip"] = "CBZ",
-    ["application/x-cbz"] = "CBZ",
-    ["application/x-zip-compressed"] = "CBZ",
-    ["application/epub+zip"] = "EPUB",
-    ["application/pdf"] = "PDF",
-    ["application/x-cbr"] = "CBR",
-    ["application/x-rar-compressed"] = "CBR",
-    ["application/x-rar"] = "CBR",
-}
-
-local function deriveFormat(media_type, filename, title)
-    if media_type and FORMATS[media_type] then
-        return FORMATS[media_type]
-    end
-    for _, str in ipairs({ filename, title }) do
-        if type(str) == "string" then
-            local ext = str:match("%.([a-zA-Z0-9]+)$")
-            if ext then
-                local u = ext:upper()
-                if u == "CBZ" or u == "ZIP" then return "CBZ" end
-                if u == "CBR" or u == "RAR" then return "CBR" end
-                if u == "EPUB" then return "EPUB" end
-                if u == "PDF" then return "PDF" end
-                if u == "MOBI" or u == "AZW3" or u == "FB2" or u == "TXT" then return u end
-            end
-        end
-    end
-    return "CBZ"
-end
-
 local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded)
+    if type(dto) ~= "table" then return nil end
     downloaded = downloaded or Dedup.getDownloadedMap()
-    local md = dto.metadata or {}
+    local md = asTable(dto.metadata) or {}
     local title = md.title or dto.name or "?"
-    local id_str = tostring(dto.id)
-    local rec_key = "komga://book/" .. id_str
-    local local_path = downloaded[rec_key] or downloaded[id_str]
+    local id_str = validateKomgaId(dto.id) or (dto.id ~= nil and tostring(dto.id) or nil)
+    local rec_key = id_str and ("komga://book/" .. id_str) or "komga://book/"
+    local local_path = id_str and (downloaded[rec_key] or downloaded[id_str]) or nil
 
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
     if local_path and ok_lfs and lfs and lfs.attributes and lfs.attributes(local_path, "mode") ~= "file" then
         local_path = nil
     end
 
-    local progress = (type(dto.readProgress) == "table") and dto.readProgress or nil
-    local page_count = (dto.media and type(dto.media.pagesCount) == "number") and dto.media.pagesCount or 0
-    local current_page = (progress and type(progress.page) == "number") and progress.page or 0
-    local pct = (progress and progress.completed and 1.0)
+    -- 1. Pure server progress (never overwritten by local sidecar)
+    local progress = asTable(dto.readProgress)
+    local media = asTable(dto.media)
+    local page_count = (media and asNumber(media.pagesCount)) or 0
+    local current_page = (progress and asNumber(progress.page)) or 0
+    local srv_completed = (progress and progress.completed == true) or false
+    local srv_pct = (srv_completed and 1.0)
         or (page_count > 0 and current_page > 0 and math.min(current_page / page_count, 0.99))
         or 0
-    local status = (progress and progress.completed and "finished")
+    local srv_status = (srv_completed and "finished")
         or ((progress and current_page > 0) and "reading" or "unread")
 
+    -- 2. Local KOReader progress (BookList cache -> DocSettings)
+    local loc_completed = false
+    local loc_pct = 0
+    local loc_status = "unread"
     if local_path then
         local found_in_cache = false
         local ok_bl, BookList = pcall(require, "ui/widget/booklist")
         local cached_info = ok_bl and BookList and BookList.book_info_cache and BookList.book_info_cache[local_path]
         if cached_info then
             local st = cached_info.status
-            local lpct = tonumber(cached_info.percent_finished)
+            local lpct = asNumber(tonumber(cached_info.percent_finished))
             if (st == "complete" or st == "finished") or (lpct and lpct >= 0.99) then
-                status = "finished"
-                pct = 1.0
+                loc_completed = true
+                loc_status = "finished"
+                loc_pct = 1.0
                 found_in_cache = true
             elseif st == "reading" or (lpct and lpct > 0) then
-                status = "reading"
-                pct = lpct or 0.5
+                loc_status = "reading"
+                loc_pct = lpct or 0
                 found_in_cache = true
             end
         end
@@ -844,55 +1091,64 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         if not found_in_cache then
             local ok_ds, DocSettings = pcall(require, "docsettings")
             if ok_ds and DocSettings and DocSettings.open then
-                local ok_o, ds = pcall(DocSettings.open, DocSettings, local_path)
+                local ok_o, ds = safeCall("bookDtoToRecord.DocSettings.open", DocSettings.open, DocSettings, local_path)
                 if ok_o and ds and ds.readSetting then
-                    local summary = ds:readSetting("summary")
-                    local lpct = tonumber(ds:readSetting("percent_finished"))
-                    if (summary and type(summary) == "table" and summary.status == "complete") or (lpct and lpct >= 0.99) then
-                        status = "finished"
-                        pct = 1.0
-                    elseif (summary and type(summary) == "table" and summary.status == "reading") or (lpct and lpct > 0) then
-                        status = "reading"
-                        pct = lpct
+                    local summary = asTable(ds:readSetting("summary"))
+                    local lpct = asNumber(tonumber(ds:readSetting("percent_finished")))
+                    if (summary and summary.status == "complete") or (lpct and lpct >= 0.99) then
+                        loc_completed = true
+                        loc_status = "finished"
+                        loc_pct = 1.0
+                    elseif (summary and summary.status == "reading") or (lpct and lpct > 0) then
+                        loc_status = "reading"
+                        loc_pct = lpct or 0
                     end
                 end
             end
         end
     end
 
-    local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
-    if ok_sq and SyncQueue and SyncQueue.getQueue then
-        local q = SyncQueue.getQueue()
-        local queued = q[id_str]
-        if queued then
-            local server_completed = (status == "finished") or (progress and progress.completed == true)
-            local server_pct = pct or 0
-            local queued_completed = (queued.completed == true)
+    -- 3. Reconcile (server, local, SyncQueue)
+    local status = srv_status
+    local pct = srv_pct
+    if loc_completed or srv_completed then
+        status = "finished"
+        pct = 1.0
+    elseif loc_pct > srv_pct then
+        status = "reading"
+        pct = loc_pct
+    elseif loc_status == "reading" and status == "unread" then
+        status = "reading"
+        pct = math.max(srv_pct, loc_pct)
+    end
 
+    local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+    if id_str and ok_sq and SyncQueue and SyncQueue.getQueue then
+        local ok_q, q = safeCall("bookDtoToRecord.SyncQueue.getQueue", SyncQueue.getQueue)
+        local queued = ok_q and asTable(q) and asTable(q[id_str]) or nil
+        if queued then
+            local queued_completed = (queued.completed == true)
             if queued.action == "delete" then
-                if not server_completed and server_pct == 0 then
-                    status = "unread"
-                    pct = 0
-                elseif ok_sq and SyncQueue.remove then
-                    SyncQueue.remove(id_str)
-                end
+                -- Offline mark-unread overrides cached server/local progress until flushed; never prune on render
+                status = "unread"
+                pct = 0
             elseif queued_completed then
                 status = "finished"
                 pct = 1.0
-            elseif server_completed then
-                -- Server is finished, queue is not finished -> server wins!
-                if ok_sq and SyncQueue.remove then
-                    SyncQueue.remove(id_str)
+            elseif srv_completed then
+                -- Pure server is finished while queued item is not -> prune stale queue item
+                if SyncQueue.remove then
+                    safeCall("bookDtoToRecord.SyncQueue.remove", SyncQueue.remove, id_str)
                 end
-            elseif queued.page and dto.media and dto.media.pagesCount and dto.media.pagesCount > 0 then
-                local queued_pct = math.min(queued.page / dto.media.pagesCount, 0.99)
-                if queued_pct > server_pct then
+            elseif asNumber(queued.page) and page_count > 0 then
+                local queued_pct = math.min(queued.page / page_count, 0.99)
+                if queued_pct > srv_pct then
                     status = "reading"
-                    pct = queued_pct
+                    pct = math.max(queued_pct, loc_pct)
                 else
-                    -- Server is further or equal -> server wins!
-                    if ok_sq and SyncQueue.remove then
-                        SyncQueue.remove(id_str)
+                    -- Pure server is further or equal -> prune stale queue item
+                    if SyncQueue.remove then
+                        safeCall("bookDtoToRecord.SyncQueue.remove", SyncQueue.remove, id_str)
                     end
                 end
             end
@@ -1090,19 +1346,31 @@ processNextCover = function()
         return
     end
 
+    local valid_type = validateTypeLabel(m.type_label)
+    local valid_id = validateKomgaId(m.id)
+    if not (valid_type and valid_id) then
+        logger.warn(string.format("[Hybrid] processNextCover rejected invalid cover job: type=%s id=%s", sanitizeLog(m.type_label), sanitizeLog(m.id)))
+        finishCoverStep(false)
+        return
+    end
+
     local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
     local api = plugin.api
     local base_url = api and api.base_url
     if ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
-            and AsyncHttp.downloadAsync and base_url and base_url ~= "" then
+            and AsyncHttp.downloadAsync and isAllowedHttpUrl(base_url) then
         local ok_ds, DataStorage = pcall(require, "datastorage")
         if ok_ds and DataStorage then
             pcall(plugin.cache.ensureStructure, plugin.cache)
             local covers_dir = DataStorage:getDataDir() .. "/komga_covers"
-            local cache_key = tostring(m.type_label) .. "_" .. tostring(m.id)
+            local cache_key = valid_type .. "_" .. valid_id
             local dest_path = covers_dir .. "/" .. cache_key .. ".jpg"
-            local endpoint_type = (m.type_label == "series") and "series" or "books"
-            local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/" .. endpoint_type .. "/" .. tostring(m.id) .. "/thumbnail"
+            if not isPathWithinRoot(dest_path, covers_dir) then
+                finishCoverStep(false)
+                return
+            end
+            local endpoint_type = (valid_type == "series") and "series" or "books"
+            local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/" .. endpoint_type .. "/" .. valid_id .. "/thumbnail"
             local headers = {}
             if api.get_headers then
                 local ok_hdr, h = pcall(api.get_headers, api)
@@ -1174,14 +1442,15 @@ function M.scheduleKomgaCovers(records)
             if not id and is_series and M.lookupSeriesIdByTitle then
                 id = M.lookupSeriesIdByTitle(rec.title or rec.label or rec.series_name)
             end
-            if id and not getKomgaCoverPath(type_label, id) then
-                local key = type_label .. "_" .. tostring(id)
+            local valid_id = validateKomgaId(id)
+            if valid_id and not getKomgaCoverPath(type_label, valid_id) then
+                local key = type_label .. "_" .. valid_id
                 if not _komga_covers_attempted[key] then
                     _komga_covers_attempted[key] = true
                     _komga_covers_queue[#_komga_covers_queue + 1] = {
                         key = key,
                         type_label = type_label,
-                        id = id,
+                        id = valid_id,
                         lastModified = rec.komga_dto and rec.komga_dto.lastModified,
                     }
                     added = added + 1
@@ -1190,9 +1459,9 @@ function M.scheduleKomgaCovers(records)
             end
             -- Also queue active_book cover if present on series record
             if rec.active_book and rec.active_book.id and added < 6 then
-                local b_id = rec.active_book.id
-                if not getKomgaCoverPath("book", b_id) then
-                    local key = "book_" .. tostring(b_id)
+                local b_id = validateKomgaId(rec.active_book.id)
+                if b_id and not getKomgaCoverPath("book", b_id) then
+                    local key = "book_" .. b_id
                     if not _komga_covers_attempted[key] then
                         _komga_covers_attempted[key] = true
                         _komga_covers_queue[#_komga_covers_queue + 1] = {
@@ -1257,12 +1526,13 @@ function M.getActiveQueue(source)
             local ondeck = {}
 
             -- 1. In-progress books
-            local ok_ip, resp_ip = pcall(api.get_books, api,
+            local ok_ip, resp_ip = safeCall("getActiveQueue.get_books", api.get_books, api,
                 { read_status = "IN_PROGRESS", sort = "readProgress.readDate,desc" }, 0, 100)
-            local content_ip = ok_ip and resp_ip and (resp_ip.content or (resp_ip[1] and resp_ip))
+            local ip_valid = ok_ip and type(resp_ip) == "table" and not resp_ip.error
+            local content_ip = ip_valid and (resp_ip.content or (resp_ip[1] and resp_ip))
             if content_ip then
                 for _, b in ipairs(content_ip) do
-                    local tb = trimBook(b)
+                    local tb = asTable(b) and trimBook(b)
                     if tb and tb.id and tb.seriesId then
                         in_progress[#in_progress + 1] = tb
                     end
@@ -1270,71 +1540,76 @@ function M.getActiveQueue(source)
             end
 
             -- 2. On Deck books
-            local ok_od, resp_od = pcall(api.get_books_ondeck, api, 0, 100)
-            local content_od = ok_od and resp_od and (resp_od.content or (resp_od[1] and resp_od))
+            local ok_od, resp_od = safeCall("getActiveQueue.get_books_ondeck", api.get_books_ondeck, api, 0, 100)
+            local od_valid = ok_od and type(resp_od) == "table" and not resp_od.error
+            local content_od = od_valid and (resp_od.content or (resp_od[1] and resp_od))
             if content_od then
                 for _, b in ipairs(content_od) do
-                    local tb = trimBook(b)
+                    local tb = asTable(b) and trimBook(b)
                     if tb and tb.id and tb.seriesId then
                         ondeck[#ondeck + 1] = tb
                     end
                 end
             end
 
-            -- Group by seriesId: in-progress takes precedence over on-deck
-            local series_map = {}
-            local series_order = {}
-            local series_source = {}
+            if ip_valid and od_valid then
+                -- Group by seriesId: in-progress takes precedence over on-deck
+                local series_map = {}
+                local series_order = {}
+                local series_source = {}
 
-            for _, b in ipairs(in_progress) do
-                local sid = tostring(b.seriesId)
-                if not series_map[sid] then
-                    series_map[sid] = b
-                    series_order[#series_order + 1] = sid
-                    series_source[sid] = "in_progress"
-                else
-                    -- Multiple in-progress books for the same series: pick highest sequence number
-                    local cur_num = Dedup.extractChapterNumber(series_map[sid]) or -1
-                    local new_num = Dedup.extractChapterNumber(b) or -1
-                    if new_num > cur_num then
+                for _, b in ipairs(in_progress) do
+                    local sid = tostring(b.seriesId)
+                    if not series_map[sid] then
                         series_map[sid] = b
+                        series_order[#series_order + 1] = sid
+                        series_source[sid] = "in_progress"
+                    else
+                        -- Multiple in-progress books for the same series: pick highest sequence number
+                        local cur_num = Dedup.extractChapterNumber(series_map[sid]) or -1
+                        local new_num = Dedup.extractChapterNumber(b) or -1
+                        if new_num > cur_num then
+                            series_map[sid] = b
+                        end
                     end
                 end
-            end
 
-            for _, b in ipairs(ondeck) do
-                local sid = tostring(b.seriesId)
-                if not series_map[sid] then
-                    series_map[sid] = b
-                    series_order[#series_order + 1] = sid
-                    series_source[sid] = "ondeck"
-                elseif series_source[sid] == "ondeck" then
-                    -- Multiple on-deck books for the same series: pick highest sequence number
-                    local cur_num = Dedup.extractChapterNumber(series_map[sid]) or -1
-                    local new_num = Dedup.extractChapterNumber(b) or -1
-                    if new_num > cur_num then
+                for _, b in ipairs(ondeck) do
+                    local sid = tostring(b.seriesId)
+                    if not series_map[sid] then
                         series_map[sid] = b
+                        series_order[#series_order + 1] = sid
+                        series_source[sid] = "ondeck"
+                    elseif series_source[sid] == "ondeck" then
+                        -- Multiple on-deck books for the same series: pick highest sequence number
+                        local cur_num = Dedup.extractChapterNumber(series_map[sid]) or -1
+                        local new_num = Dedup.extractChapterNumber(b) or -1
+                        if new_num > cur_num then
+                            series_map[sid] = b
+                        end
                     end
                 end
+
+                local items = {
+                    by_series = series_map,
+                    series_order = series_order,
+                }
+
+                cached_entry = items
+                safeCall("getActiveQueue.persist", function()
+                    local DataStorage = require("datastorage")
+                    local LuaSettings = require("luasettings")
+                    local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+                    if s then
+                        local lists = s:readSetting("lists") or {}
+                        lists["active_queue"] = { fetched_at = os.time(), items = items }
+                        s:saveSetting("lists", lists)
+                        s:flush()
+                    end
+                end)
+            else
+                logger.warn("[Hybrid] getActiveQueue skipping cache overwrite due to API error; preserving previous cache")
             end
-
-            local items = {
-                by_series = series_map,
-                series_order = series_order,
-            }
-
-            cached_entry = items
-            pcall(function()
-                local DataStorage = require("datastorage")
-                local LuaSettings = require("luasettings")
-                local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-                if s then
-                    local lists = s:readSetting("lists") or {}
-                    lists["active_queue"] = { fetched_at = os.time(), items = items }
-                    s:saveSetting("lists", lists)
-                    s:flush()
-                end
-            end)
         end
     end
 
@@ -1516,19 +1791,22 @@ function M.getAllSeries(source, force_refresh)
             local page = 0
             local page_size = 500
             local has_more = true
+            local fetch_complete = true
 
             while has_more and page < 20 do
-                local ok_res, resp = pcall(api.query_series, api, {
+                local ok_res, resp = safeCall("getAllSeries.query_series", api.query_series, api, {
                     library_id = lib_param,
                     sort = "metadata.titleSort,asc",
                     page = page,
                     size = page_size,
                 })
-                if not ok_res or not resp then
+                if not ok_res or type(resp) ~= "table" or resp.error then
+                    fetch_complete = false
+                    logger.warn(string.format("[Hybrid] getAllSeries aborted at page %d; preserving previous cache", page))
                     break
                 end
 
-                local content = resp and (resp.content or (resp[1] and resp))
+                local content = resp.content or (resp[1] and resp)
                 if content and type(content) == "table" then
                     for _, s in ipairs(content) do
                         local ts = asTable(s) and trimSeries(s)
@@ -1538,7 +1816,7 @@ function M.getAllSeries(source, force_refresh)
                     end
                 end
 
-                if resp and resp.last == true then
+                if resp.last == true then
                     has_more = false
                 elseif not content or #content < page_size then
                     has_more = false
@@ -1547,10 +1825,10 @@ function M.getAllSeries(source, force_refresh)
                 end
             end
 
-            if #all_items > 0 or page > 0 then
+            if fetch_complete and not has_more and (#all_items > 0 or page > 0) then
                 cached_entry = all_items
                 _mem_all_series[lib_key] = { fetched_at = os.time(), items = all_items }
-                pcall(function()
+                safeCall("getAllSeries.persist", function()
                     local DataStorage = require("datastorage")
                     local LuaSettings = require("luasettings")
                     local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
@@ -1787,9 +2065,10 @@ function M.expandSeriesToBooks(source, series_entry, sort_priority, local_folder
         if ok_lfs and lfs and lfs.attributes then
             return lfs.attributes(p, "mode") == "directory"
         end
-        return not p:match("%.%a%w%w?%w?$")
+        return false
     end
 
+    local safe_series_dir = sanitizePathComponent(series_title, nil)
     local folder_path = nil
     if is_dir(series_entry.path) then
         folder_path = series_entry.path
@@ -1798,14 +2077,14 @@ function M.expandSeriesToBooks(source, series_entry, sort_priority, local_folder
     elseif series_entry.filepath and type(series_entry.filepath) == "string" and series_entry.filepath:find("^/") then
         local parent = series_entry.filepath:match("(.+)/[^/]+$")
         if is_dir(parent) then folder_path = parent end
-    elseif local_folder_path and type(local_folder_path) == "string" and local_folder_path:find("^/") then
-        local candidate = local_folder_path:gsub("/+$", "") .. "/" .. series_title
-        if is_dir(candidate) then
+    elseif safe_series_dir and local_folder_path and type(local_folder_path) == "string" and local_folder_path:find("^/") then
+        local candidate = local_folder_path:gsub("/+$", "") .. "/" .. safe_series_dir
+        if isPathWithinRoot(candidate, local_folder_path) and is_dir(candidate) then
             folder_path = candidate
         end
-    elseif source and source.local_folder and type(source.local_folder) == "string" then
-        local candidate = source.local_folder:gsub("/+$", "") .. "/" .. series_title
-        if is_dir(candidate) then
+    elseif safe_series_dir and source and source.local_folder and type(source.local_folder) == "string" then
+        local candidate = source.local_folder:gsub("/+$", "") .. "/" .. safe_series_dir
+        if isPathWithinRoot(candidate, source.local_folder) and is_dir(candidate) then
             folder_path = candidate
         end
     end
@@ -2248,14 +2527,19 @@ function M.getKomgaFolderRecords(source, folder_path)
 end
 
 function M.getOpdsDrillRecords(source, drill)
-    local feed_url = drill.feed_url
-    local server_key = drill.server_key or source.opds_id or source.id
+    local feed_url = drill and drill.feed_url
+    local server_key = (drill and drill.server_key) or (source and (source.opds_id or source.id))
     if not (feed_url and server_key) then return {}, 0 end
+    if not isAllowedHttpUrl(feed_url) then
+        logger.warn("[Hybrid] getOpdsDrillRecords rejected invalid feed_url: " .. sanitizeLog(feed_url))
+        return {}, 0
+    end
 
     local ok_w, OpdsWindow = pcall(require, "lib/bookshelf_opds_window")
     if not (ok_w and OpdsWindow) then return {}, 0 end
 
     local win = OpdsWindow.load(server_key, feed_url)
+    if type(win) ~= "table" then return {}, 0 end
     local count = tonumber(win.count) or 0
 
     if count == 0 and not win.complete then
@@ -2263,19 +2547,27 @@ function M.getOpdsDrillRecords(source, drill)
         local ok_s, OpdsSource = pcall(require, "lib/bookshelf_opds_source")
         if ok_f and OpdsFeed and ok_s and OpdsSource then
             local server = OpdsSource.getServer(server_key)
-            local user = server and server.username
-            local pass = server and server.password
-            local ok_req, res = pcall(OpdsFeed.fetch, feed_url, user, pass)
+            local base_url = server and server.url
+            if base_url and not isSameHost(feed_url, base_url) then
+                logger.warn("[Hybrid] getOpdsDrillRecords blocked cross-host OPDS fetch: " .. sanitizeLog(feed_url))
+                return {}, 0
+            end
+            local user, pass = nil, nil
+            if server and base_url and isSameOriginForAuth(feed_url, base_url) then
+                user = server.username
+                pass = server.password
+            end
+            local ok_req, res = safeCall("getOpdsDrillRecords.fetch", OpdsFeed.fetch, feed_url, user, pass)
             local body = (type(res) == "table" and res.body) or (type(res) == "string" and res) or nil
             if ok_req and body and body ~= "" then
-                local ok_p, cat = pcall(OpdsFeed.parse, body)
+                local ok_p, cat = safeCall("getOpdsDrillRecords.parse", OpdsFeed.parse, body)
                 if ok_p and cat then
-                    local ok_m, mapped = pcall(OpdsFeed.mapEntries, cat, feed_url, server_key)
+                    local ok_m, mapped = safeCall("getOpdsDrillRecords.mapEntries", OpdsFeed.mapEntries, cat, feed_url, server_key)
                     if ok_m and mapped then
                         OpdsWindow.appendPage(win, mapped)
                         win.fetched_at = os.time()
                         win.complete = mapped.next_url == nil
-                        pcall(OpdsWindow.save, server_key, feed_url, win)
+                        safeCall("getOpdsDrillRecords.save", OpdsWindow.save, server_key, feed_url, win)
                         count = tonumber(win.count) or 0
                     end
                 end
@@ -2460,6 +2752,12 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
     local is_legacy = type(opts_or_dest) == "string" and type(on_success_callback) ~= "function"
     local komga = getKomgaPlugin()
     local target_dto = M.toKomgaBookDto(book)
+    local book_id = validateKomgaId(target_dto and target_dto.id)
+    if not book_id then
+        local err_msg = "Invalid or missing Komga book ID"
+        if on_failure_callback then on_failure_callback(err_msg) end
+        return nil, err_msg
+    end
     local series_title = book.series_name or (target_dto and target_dto.seriesTitle) or "Komga"
 
     -- Primary: Delegate directly to Kokomga's native download mechanism
@@ -2482,33 +2780,38 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
     -- Fallback: Asynchronous or direct download via Komga API
     local dest_path = (type(opts_or_dest) == "string" and opts_or_dest) or M.resolveDownloadDestination(book)
     local tmp_path = dest_path .. ".part"
-    local book_id = target_dto and target_dto.id
-    if not book_id then
-        if on_failure_callback then on_failure_callback("Missing Komga book ID") end
-        return nil, "Missing Komga book ID"
-    end
 
     local api = (komga and komga.api) or getKomgaApi()
     if api and api.download_book then
-        local ok_dl, dl_err = api:download_book(book_id, tmp_path)
-        if ok_dl then
-            os.rename(tmp_path, dest_path)
+        local ok_call, ok_dl, dl_err = safeCall("downloadKomgaBook.api.download_book", api.download_book, api, book_id, tmp_path)
+        if ok_call and ok_dl then
+            local ok_ren = os.rename(tmp_path, dest_path)
+            if not ok_ren then
+                local ok_cp, cp_err = copyFileChunked(tmp_path, dest_path, 65536)
+                pcall(os.remove, tmp_path)
+                if not ok_cp then
+                    if on_failure_callback then on_failure_callback(tostring(cp_err)) end
+                    return nil, cp_err
+                end
+            end
             M.registerDownloadedBook(book, dest_path)
             if on_success_callback then on_success_callback(dest_path) end
             return dest_path
         else
-            if on_failure_callback then on_failure_callback(tostring(dl_err)) end
-            return nil, dl_err
+            pcall(os.remove, tmp_path)
+            local err_msg = not ok_call and tostring(ok_dl) or tostring(dl_err)
+            if on_failure_callback then on_failure_callback(err_msg) end
+            return nil, err_msg
         end
     end
 
-    if not api or not api.base_url or api.base_url == "" then
+    if not api or not isAllowedHttpUrl(api.base_url) then
         if on_failure_callback then on_failure_callback("Komga API unavailable") end
         return nil, "Komga API unavailable"
     end
 
-    local url = api.base_url .. "/api/v1/books/" .. tostring(book_id) .. "/file"
-    local headers = api.get_headers and api:get_headers() or {}
+    local url = tostring(api.base_url):gsub("/+$", "") .. "/api/v1/books/" .. book_id .. "/file"
+    local headers = copyTableShallow(api.get_headers and api:get_headers() or nil)
     headers["Accept"] = nil
     headers["User-Agent"] = "KOReader-Bookshelf"
 
@@ -2546,9 +2849,24 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
         return nil, err_msg
     end
 
+    local bytes_written = 0
+    local write_err = nil
     local function progress_sink(chunk, err)
+        if err then
+            write_err = tostring(err)
+            return nil, write_err
+        end
         if chunk and #chunk > 0 then
-            file:write(chunk)
+            bytes_written = bytes_written + #chunk
+            if bytes_written > DEFAULT_MAX_DOWNLOAD_BYTES then
+                write_err = "Download exceeds maximum size limit"
+                return nil, write_err
+            end
+            local ok_w, err_w = file:write(chunk)
+            if not ok_w then
+                write_err = "Write failed: " .. tostring(err_w)
+                return nil, write_err
+            end
         end
         return 1
     end
@@ -2557,23 +2875,73 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
         socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT or 30, socketutil.FILE_TOTAL_TIMEOUT or 300)
     end)
 
-    local request_params = {
-        url = url,
-        method = "GET",
-        headers = headers,
-        sink = progress_sink,
-        timeout = 120,
-    }
-
-    local res, code, res_headers, status
-    if url:find("https://") == 1 then
-        res, code, res_headers, status = https.request(request_params)
-    else
-        res, code, res_headers, status = http.request(request_params)
+    local ca_bundle = resolveCaBundle()
+    local cur_url = url
+    local cur_headers = copyTableShallow(headers)
+    local ok_req, res, code, res_headers, status
+    for hop = 1, 6 do
+        local parsed = parseHttpUrl(cur_url)
+        if not parsed then
+            ok_req, res, code, status = false, nil, 0, "Invalid redirect URL"
+            break
+        end
+        local request_params = {
+            url = cur_url,
+            method = "GET",
+            headers = cur_headers,
+            sink = progress_sink,
+            timeout = 120,
+            redirect = false,
+        }
+        if parsed.scheme == "https" then
+            request_params.verify = "peer"
+            if ca_bundle then request_params.cafile = ca_bundle end
+            ok_req, res, code, res_headers, status = safeCall("downloadKomgaBook.https.request", https.request, request_params)
+        else
+            ok_req, res, code, res_headers, status = safeCall("downloadKomgaBook.http.request", http.request, request_params)
+        end
+        if not ok_req then break end
+        local num_code = tonumber(code) or 0
+        if (num_code == 301 or num_code == 302 or num_code == 303 or num_code == 307 or num_code == 308)
+                and type(res_headers) == "table" and hop < 6 then
+            local loc = res_headers["location"] or res_headers["Location"]
+            if not isAllowedHttpUrl(loc) then
+                ok_req, res, code, status = false, nil, 0, "Invalid redirect location"
+                break
+            end
+            local next_parsed = parseHttpUrl(loc)
+            if parsed.scheme == "https" and next_parsed.scheme ~= "https" then
+                ok_req, res, code, status = false, nil, 0, "Blocked HTTPS to HTTP redirect"
+                break
+            end
+            if not isSameOriginForAuth(loc, cur_url) then
+                cur_headers["Authorization"] = nil
+                cur_headers["authorization"] = nil
+                cur_headers["X-API-Key"] = nil
+                cur_headers["x-api-key"] = nil
+            end
+            cur_url = loc
+        else
+            break
+        end
     end
 
     pcall(function() socketutil:reset_timeout() end)
-    pcall(file.close, file)
+    local ok_close, close_err = file:close()
+
+    if not ok_req then
+        pcall(os.remove, tmp_path)
+        local err_msg = "Download request failed: " .. tostring(res)
+        if on_failure_callback then on_failure_callback(err_msg) end
+        return nil, err_msg
+    end
+
+    if write_err or not ok_close then
+        pcall(os.remove, tmp_path)
+        local err_msg = write_err or ("Failed to flush downloaded file: " .. tostring(close_err))
+        if on_failure_callback then on_failure_callback(err_msg) end
+        return nil, err_msg
+    end
 
     code = tonumber(code) or 0
     if not res or code < 200 or code >= 300 then
@@ -2585,15 +2953,10 @@ function M.downloadKomgaBook(book, opts_or_dest, on_success_callback, on_failure
 
     local ok_ren = os.rename(tmp_path, dest_path)
     if not ok_ren then
-        local rf = io.open(tmp_path, "rb")
-        local wf = io.open(dest_path, "wb")
-        if rf and wf then
-            wf:write(rf:read("*a"))
-            rf:close()
-            wf:close()
-            pcall(os.remove, tmp_path)
-        else
-            local err_msg = "Failed to save file: " .. tostring(dest_path)
+        local ok_cp, cp_err = copyFileChunked(tmp_path, dest_path, 65536)
+        pcall(os.remove, tmp_path)
+        if not ok_cp then
+            local err_msg = "Failed to save file: " .. tostring(cp_err or dest_path)
             if on_failure_callback then on_failure_callback(err_msg) end
             return nil, err_msg
         end
@@ -2652,37 +3015,90 @@ function M.registerDownloadedBook(book, local_path)
 end
 
 function M.deleteDownloadedBook(book, local_path)
-    if not local_path or local_path == "" then return false end
-    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-    if ok_lfs and lfs and lfs.attributes and lfs.attributes(local_path, "mode") == "file" then
-        pcall(os.remove, local_path)
+    if type(local_path) ~= "string" or local_path == "" then return false, "invalid_path" end
+    local norm_path = normalizeAbsPath(local_path)
+    if not norm_path then
+        logger.warn("[Hybrid] deleteDownloadedBook rejected unsafe path: " .. sanitizeLog(local_path))
+        return false, "unsafe_path"
     end
-    local sidecar = local_path:gsub("%.%w+$", ".cover.jpg")
-    pcall(os.remove, sidecar)
 
-    local book_id = book.komga_book_id or book.komga_id or (type(book.filepath) == "string" and book.filepath:match("^komga://book/(.+)$"))
-    local rec_key = "komga://book/" .. tostring(book_id or "")
+    -- Verify path is either inside an allowed download/data root or explicitly registered in downloads map
+    local allowed_roots = {}
+    local komga = getKomgaPlugin()
+    if komga and komga.getDownloadDir then
+        local ok_d, d = pcall(komga.getDownloadDir, komga)
+        if ok_d and type(d) == "string" and d ~= "" then allowed_roots[#allowed_roots + 1] = d end
+    end
+    local ok_hd, HomeDir = pcall(require, "lib/bookshelf_home_dir")
+    if ok_hd and HomeDir and HomeDir.get then
+        local d = HomeDir.get()
+        if type(d) == "string" and d ~= "" then allowed_roots[#allowed_roots + 1] = d end
+    end
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    if ok_ds and DataStorage and DataStorage.getDataDir then
+        local dd = DataStorage:getDataDir()
+        if type(dd) == "string" and dd ~= "" then allowed_roots[#allowed_roots + 1] = dd end
+    end
 
-    pcall(function()
+    local in_allowed_root = false
+    for _, r in ipairs(allowed_roots) do
+        if isPathWithinRoot(norm_path, r) then
+            in_allowed_root = true
+            break
+        end
+    end
+    if not in_allowed_root then
+        local dm = Dedup and Dedup.getDownloadedMap and Dedup.getDownloadedMap() or {}
+        for _, p in pairs(dm) do
+            if p == local_path or normalizeAbsPath(p) == norm_path then
+                in_allowed_root = true
+                break
+            end
+        end
+    end
+    if not in_allowed_root then
+        logger.warn("[Hybrid] deleteDownloadedBook rejected path outside allowed roots: " .. sanitizeLog(local_path))
+        return false, "path_outside_root"
+    end
+
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok_lfs and lfs and lfs.attributes and lfs.attributes(norm_path, "mode") == "file" then
+        local ok_rm, rm_err = os.remove(norm_path)
+        if not ok_rm then
+            logger.warn("[Hybrid] deleteDownloadedBook failed to remove file: " .. sanitizeLog(rm_err))
+            return false, rm_err
+        end
+    end
+    local sidecar = norm_path:gsub("%.%w+$", ".cover.jpg")
+    if sidecar ~= norm_path and sidecar:match("%.cover%.jpg$") then
+        pcall(os.remove, sidecar)
+    end
+
+    local book_id = book and validateKomgaId(
+        book.komga_book_id or book.komga_id
+        or (type(book.filepath) == "string" and book.filepath:match("^komga://book/(.+)$"))
+    ) or nil
+    local rec_key = book_id and ("komga://book/" .. book_id) or nil
+
+    safeCall("deleteDownloadedBook.store", function()
         local ok_s, Store = pcall(require, "lib/bookshelf_settings_store")
         if ok_s and Store and Store.read and Store.save then
             local map = Store.read("opds_downloads") or {}
-            map[rec_key] = nil
-            if type(book.filepath) == "string" then map[book.filepath] = nil end
+            if rec_key then map[rec_key] = nil end
+            if book and type(book.filepath) == "string" then map[book.filepath] = nil end
             Store.save("opds_downloads", map)
         end
     end)
 
-    pcall(function()
-        local komga = getKomgaPlugin()
+    safeCall("deleteDownloadedBook.kokomga_dl", function()
         if komga and komga.getOpdsDownloadsPath then
             local ok_ls, LuaSettings = pcall(require, "luasettings")
             if ok_ls and LuaSettings then
                 local kokomga_dl = LuaSettings:open(komga:getOpdsDownloadsPath())
                 if kokomga_dl then
                     local downloads = kokomga_dl:readSetting("downloads") or {}
-                    downloads[rec_key] = nil
-                    if type(book.filepath) == "string" then downloads[book.filepath] = nil end
+                    if rec_key then downloads[rec_key] = nil end
+                    if book and type(book.filepath) == "string" then downloads[book.filepath] = nil end
                     kokomga_dl:saveSetting("downloads", downloads)
                     kokomga_dl:flush()
                 end
@@ -2690,7 +3106,7 @@ function M.deleteDownloadedBook(book, local_path)
         end
     end)
 
-    pcall(function()
+    safeCall("deleteDownloadedBook.invalidateRepo", function()
         local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
         if ok_r and Repo and Repo.invalidateWalkCache then
             Repo.invalidateWalkCache()
@@ -2705,7 +3121,11 @@ function M.deleteDownloadedBook(book, local_path)
 end
 
 function M.setKomgaReadProgress(book_id, completed)
-    if not book_id then return false end
+    local valid_id = validateKomgaId(book_id)
+    if not valid_id then
+        return false, "invalid_book_id"
+    end
+    book_id = valid_id
 
     local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
     local ok_h, Health = pcall(require, "lib/bridge_health")
