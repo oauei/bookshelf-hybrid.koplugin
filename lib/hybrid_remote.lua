@@ -246,11 +246,12 @@ function M.getOpdsRecords(source)
     if not (server_id and feed_url) then return {}, false end
 
     local win = OpdsWindow.load(server_id, feed_url)
+    if type(win) ~= "table" then return {}, true end
     local count = tonumber(win.count) or 0
     local records = {}
 
     if count > 0 then
-        local page = OpdsWindow.slice(win, 0, count)
+        local page = OpdsWindow.slice(win, 0, count) or {}
         for i = 1, #page do
             local rec = page[i]
             rec.source_kind = "hybrid"
@@ -303,9 +304,9 @@ function M.getOpdsFolderRecords(source, folder_path)
     local ok_w, OpdsWindow = pcall(require, "lib/bookshelf_opds_window")
     if not (ok_w and OpdsWindow) then return {}, false end
 
-    local root_records, _ = M.getOpdsRecords(source)
+    local root_records, root_needs_fetch = M.getOpdsRecords(source)
     local records = {}
-    local needs_fetch = false
+    local needs_fetch = root_needs_fetch == true
 
     for _, nav in ipairs(root_records) do
         local nav_key = (nav.is_opds_nav or nav.is_folder) and Dedup.nameKey(nav.label or nav.name or nav.title)
@@ -313,21 +314,25 @@ function M.getOpdsFolderRecords(source, folder_path)
         if Dedup.nameKeysMatch(nav_key, folder_key) and type(child_feed_url) == "string" then
             local server_id = source.opds_id or source.id
             local child = OpdsWindow.load(server_id, child_feed_url)
-            local child_count = tonumber(child.count) or 0
-            if child_count > 0 then
-                local page = OpdsWindow.slice(child, 0, child_count)
-                for i = 1, #page do
-                    local rec = page[i]
-                    rec.source_kind = "hybrid"
-                    rec.is_remote = not rec.downloaded
-                    rec.label = rec.label or rec.title or rec.series_name
-                    rec.title = rec.title or rec.label or rec.series_name
-                    rec.display_title = rec.display_title or rec.title
-                    rec.series_name = rec.series_name or rec.label or rec.title
-                    records[#records + 1] = rec
+            if type(child) == "table" then
+                local child_count = tonumber(child.count) or 0
+                if child_count > 0 then
+                    local page = OpdsWindow.slice(child, 0, child_count) or {}
+                    for i = 1, #page do
+                        local rec = page[i]
+                        rec.source_kind = "hybrid"
+                        rec.is_remote = not rec.downloaded
+                        rec.label = rec.label or rec.title or rec.series_name
+                        rec.title = rec.title or rec.label or rec.series_name
+                        rec.display_title = rec.display_title or rec.title
+                        rec.series_name = rec.series_name or rec.label or rec.title
+                        records[#records + 1] = rec
+                    end
                 end
-            end
-            if not child.complete or (child_count == 0 and (tonumber(child.fetched_at) or 0) == 0) then
+                if not child.complete or (child_count == 0 and (tonumber(child.fetched_at) or 0) == 0) then
+                    needs_fetch = true
+                end
+            else
                 needs_fetch = true
             end
         end
@@ -413,20 +418,36 @@ local function getKomgaPlugin()
 end
 
 local function patchApiTable(target)
-    if not (target and target.get_books_for_series) then return false end
+    if type(target) ~= "table" or type(target.get_books_for_series) ~= "function" then return false end
     if target._bridge_sort_patched then return true end
     target._bridge_sort_patched = true
 
     local orig_get_books = target.get_books_for_series
     target.get_books_for_series = function(self, series_id, filters, page, size)
+        local ok_res, res, err = pcall(orig_get_books, self, series_id, filters, page, size)
+        if ok_res and res then
+            -- Retry without sort ONLY if server explicitly rejected sort (HTTP 400 / sort error)
+            local is_sort_err = type(res) == "table" and (res.status == 400 or res.code == 400)
+                and (tostring(res.error or res.message or ""):lower():find("sort") ~= nil)
+            if not is_sort_err then
+                return res, err
+            end
+        elseif ok_res and not res and filters and filters.sort then
+            local err_s = tostring(err or ""):lower()
+            if not (err_s:find("400") or err_s:find("sort")) then
+                return res, err
+            end
+        elseif not ok_res then
+            error(res, 0)
+        end
+
         if filters and filters.sort then
             local clean = {}
             for k, v in pairs(filters) do clean[k] = v end
             clean.sort = nil
-            local ok_res, res = pcall(orig_get_books, self, series_id, clean, page, size)
-            if ok_res and res then return res end
+            return orig_get_books(self, series_id, clean, page, size)
         end
-        return orig_get_books(self, series_id, filters, page, size)
+        return res, err
     end
     return true
 end
@@ -1211,10 +1232,26 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
     }
 end
 
+local MAX_COVER_RETRIES = 3
+local COVER_RETRY_COOLDOWN = 60
+local MAX_ATTEMPTED_CACHE = 2000
+
 local _komga_covers_queue = {}
-local _komga_covers_attempted = {}
+local _komga_covers_attempts = {}
+local _komga_covers_attempts_count = 0
 local _komga_queue_running = false
 local _repaint_scheduled = false
+local _repaint_timer = nil
+local _cover_meta_dirty = false
+
+local function flushCoverMetadata(plugin)
+    if not _cover_meta_dirty then return end
+    _cover_meta_dirty = false
+    plugin = plugin or getKomgaPlugin()
+    if plugin and plugin.saveSettings then
+        safeCall("flushCoverMetadata.saveSettings", plugin.saveSettings, plugin)
+    end
+end
 
 local function isModalOrMenuOpen(UIManager)
     if not UIManager then return false end
@@ -1252,11 +1289,18 @@ end
 
 local function scheduleRepaint(immediate)
     if _repaint_scheduled and not immediate then return end
+    local ok_ui, UIManager = pcall(require, "ui/uimanager")
+    if _repaint_scheduled and immediate and _repaint_timer and ok_ui and UIManager and UIManager.unschedule then
+        pcall(UIManager.unschedule, UIManager, _repaint_timer)
+        _repaint_timer = nil
+        _repaint_scheduled = false
+    end
     local delay = immediate and 0.1 or 1.5
     _repaint_scheduled = true
-    local ok_ui, UIManager = pcall(require, "ui/uimanager")
     if ok_ui and UIManager and UIManager.scheduleIn then
-        UIManager:scheduleIn(delay, function()
+        local cb
+        cb = function()
+            _repaint_timer = nil
             -- If a menu or modal dialog is currently open, defer repaint so we do not
             -- rebuild the shelf underneath the active popup and cause flashing
             if isModalOrMenuOpen(UIManager) then
@@ -1266,18 +1310,21 @@ local function scheduleRepaint(immediate)
             end
 
             _repaint_scheduled = false
+            flushCoverMetadata()
             M.clearCoverPathCache()
             local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
             if ok_s and Sources and Sources.changed then
-                Sources.changed("hybrid")
+                safeCall("scheduleRepaint.Sources.changed", Sources.changed, "hybrid")
             end
-        end)
+        end
+        _repaint_timer = UIManager:scheduleIn(delay, cb) or cb
     else
         _repaint_scheduled = false
+        flushCoverMetadata()
         M.clearCoverPathCache()
         local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
         if ok_s and Sources and Sources.changed then
-            Sources.changed("hybrid")
+            safeCall("scheduleRepaint.Sources.changed", Sources.changed, "hybrid")
         end
     end
 end
@@ -1285,23 +1332,53 @@ end
 local _covers_downloaded_in_batch = 0
 local processNextCover
 
-local function finishCoverStep(downloaded)
+local function abortCoverQueue(reason)
+    -- Clear queued/in-flight markers so aborted covers remain retryable after reconnect
+    for _, item in ipairs(_komga_covers_queue) do
+        if item and item.key and _komga_covers_attempts[item.key] and _komga_covers_attempts[item.key].state == "queued" then
+            _komga_covers_attempts[item.key] = nil
+            _komga_covers_attempts_count = math.max(0, _komga_covers_attempts_count - 1)
+        end
+    end
+    _komga_covers_queue = {}
+    _komga_queue_running = false
+    flushCoverMetadata()
+    if _covers_downloaded_in_batch > 0 then
+        _covers_downloaded_in_batch = 0
+        scheduleRepaint(true)
+    end
+end
+
+local function finishCoverStep(downloaded, job_key)
+    if job_key then
+        local rec = _komga_covers_attempts[job_key]
+        if rec then
+            if downloaded then
+                rec.state = "ok"
+            else
+                rec.state = "failed"
+                rec.count = (rec.count or 0) + 1
+                rec.last_ts = os.time()
+            end
+        end
+    end
     if downloaded then
         _covers_downloaded_in_batch = _covers_downloaded_in_batch + 1
     end
     if #_komga_covers_queue > 0 then
         if downloaded and (_covers_downloaded_in_batch % 20) == 0 then
+            flushCoverMetadata()
             scheduleRepaint(false)
         end
         local ok_ui, UIManager = pcall(require, "ui/uimanager")
         if ok_ui and UIManager and UIManager.scheduleIn then
             UIManager:scheduleIn(0.15, processNextCover)
         else
-            _komga_queue_running = false
-            _covers_downloaded_in_batch = 0
+            abortCoverQueue("no_uimanager")
         end
     else
         _komga_queue_running = false
+        flushCoverMetadata()
         if _covers_downloaded_in_batch > 0 then
             _covers_downloaded_in_batch = 0
             scheduleRepaint(true)
@@ -1309,40 +1386,63 @@ local function finishCoverStep(downloaded)
     end
 end
 
+local function canAttemptCover(key)
+    local rec = _komga_covers_attempts[key]
+    if not rec then return true end
+    if rec.state == "ok" or rec.state == "queued" then return false end
+    if rec.state == "failed" then
+        if (rec.count or 0) >= MAX_COVER_RETRIES then return false end
+        return (os.time() - (rec.last_ts or 0)) >= COVER_RETRY_COOLDOWN
+    end
+    return true
+end
+
+local function markCoverQueued(key)
+    if not _komga_covers_attempts[key] then
+        if _komga_covers_attempts_count >= MAX_ATTEMPTED_CACHE then
+            _komga_covers_attempts = {}
+            _komga_covers_attempts_count = 0
+        end
+        _komga_covers_attempts[key] = { count = 0, last_ts = os.time(), state = "queued" }
+        _komga_covers_attempts_count = _komga_covers_attempts_count + 1
+    else
+        _komga_covers_attempts[key].state = "queued"
+        _komga_covers_attempts[key].last_ts = os.time()
+    end
+end
+
 processNextCover = function()
     if #_komga_covers_queue == 0 then
         _komga_queue_running = false
-        _covers_downloaded_in_batch = 0
+        flushCoverMetadata()
+        if _covers_downloaded_in_batch > 0 then
+            _covers_downloaded_in_batch = 0
+            scheduleRepaint(true)
+        end
         return
     end
 
     local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
     if ok_net and NetworkMgr and NetworkMgr.isConnected and not NetworkMgr:isConnected() then
-        _komga_covers_queue = {}
-        _komga_queue_running = false
-        _covers_downloaded_in_batch = 0
+        abortCoverQueue("offline")
         return
     end
 
     local ok_h, Health = pcall(require, "lib/bridge_health")
     if ok_h and Health and Health.isServerReachable and not Health.isServerReachable() then
-        _komga_covers_queue = {}
-        _komga_queue_running = false
-        _covers_downloaded_in_batch = 0
+        abortCoverQueue("unreachable")
         return
     end
 
     local plugin = getKomgaPlugin()
     if not (plugin and plugin.cache and plugin.cache.cacheThumbnail) then
-        _komga_covers_queue = {}
-        _komga_queue_running = false
-        _covers_downloaded_in_batch = 0
+        abortCoverQueue("no_plugin")
         return
     end
 
     local m = table.remove(_komga_covers_queue, 1)
     if not m then
-        finishCoverStep(false)
+        finishCoverStep(false, nil)
         return
     end
 
@@ -1350,71 +1450,79 @@ processNextCover = function()
     local valid_id = validateKomgaId(m.id)
     if not (valid_type and valid_id) then
         logger.warn(string.format("[Hybrid] processNextCover rejected invalid cover job: type=%s id=%s", sanitizeLog(m.type_label), sanitizeLog(m.id)))
-        finishCoverStep(false)
+        finishCoverStep(false, m.key)
         return
     end
 
-    local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
-    local api = plugin.api
-    local base_url = api and api.base_url
-    if ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
-            and AsyncHttp.downloadAsync and isAllowedHttpUrl(base_url) then
-        local ok_ds, DataStorage = pcall(require, "datastorage")
-        if ok_ds and DataStorage then
-            pcall(plugin.cache.ensureStructure, plugin.cache)
-            local covers_dir = DataStorage:getDataDir() .. "/komga_covers"
-            local cache_key = valid_type .. "_" .. valid_id
-            local dest_path = covers_dir .. "/" .. cache_key .. ".jpg"
-            if not isPathWithinRoot(dest_path, covers_dir) then
-                finishCoverStep(false)
-                return
-            end
-            local endpoint_type = (valid_type == "series") and "series" or "books"
-            local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/" .. endpoint_type .. "/" .. valid_id .. "/thumbnail"
-            local headers = {}
-            if api.get_headers then
-                local ok_hdr, h = pcall(api.get_headers, api)
-                if ok_hdr and type(h) == "table" then
-                    for k, v in pairs(h) do headers[k] = v end
+    local ok_step, step_err = pcall(function()
+        local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
+        local api = plugin.api
+        local base_url = api and api.base_url
+        if ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable()
+                and AsyncHttp.downloadAsync and isAllowedHttpUrl(base_url) then
+            local ok_ds, DataStorage = pcall(require, "datastorage")
+            if ok_ds and DataStorage then
+                safeCall("processNextCover.ensureStructure", plugin.cache.ensureStructure, plugin.cache)
+                local covers_dir = DataStorage:getDataDir() .. "/komga_covers"
+                local cache_key = valid_type .. "_" .. valid_id
+                local dest_path = covers_dir .. "/" .. cache_key .. ".jpg"
+                if not isPathWithinRoot(dest_path, covers_dir) then
+                    finishCoverStep(false, m.key)
+                    return
                 end
-            end
-            local ok_ba, BridgeAuth = pcall(require, "lib/bridge_auth")
-            if ok_ba and BridgeAuth and BridgeAuth.getAuthHeaders then
-                local extra = BridgeAuth.getAuthHeaders(url)
-                if type(extra) == "table" then
-                    for k, v in pairs(extra) do
-                        if not headers[k] then headers[k] = v end
+                local endpoint_type = (valid_type == "series") and "series" or "books"
+                local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/" .. endpoint_type .. "/" .. valid_id .. "/thumbnail"
+                local headers = {}
+                if api.get_headers then
+                    local ok_hdr, h = safeCall("processNextCover.get_headers", api.get_headers, api)
+                    if ok_hdr and type(h) == "table" then
+                        for k, v in pairs(h) do headers[k] = v end
                     end
                 end
-            end
-            local launched = AsyncHttp.downloadAsync({
-                url = url,
-                headers = headers,
-                tmp_path = dest_path .. ".tmp",
-                dest_path = dest_path,
-                connect_timeout = 2,
-                max_time = 8,
-            }, function(ok)
-                if ok then
-                    local meta_cache = plugin.settings and plugin.settings.library_metadata_cache
-                    if meta_cache and meta_cache.covers then
-                        meta_cache.covers[cache_key] = m.lastModified
-                        if plugin.saveSettings then
-                            pcall(plugin.saveSettings, plugin)
+                local ok_ba, BridgeAuth = pcall(require, "lib/bridge_auth")
+                if ok_ba and BridgeAuth and BridgeAuth.getAuthHeaders then
+                    local ok_ex, extra = safeCall("processNextCover.getAuthHeaders", BridgeAuth.getAuthHeaders, url)
+                    if ok_ex and type(extra) == "table" then
+                        for k, v in pairs(extra) do
+                            if not headers[k] then headers[k] = v end
                         end
                     end
                 end
-                finishCoverStep(ok == true)
-            end)
-            if launched then
-                return
+                local launched = AsyncHttp.downloadAsync({
+                    url = url,
+                    headers = headers,
+                    tmp_path = dest_path .. ".tmp",
+                    dest_path = dest_path,
+                    connect_timeout = 2,
+                    max_time = 8,
+                }, function(ok, code, _, err_msg)
+                    if ok then
+                        local meta_cache = plugin.settings and plugin.settings.library_metadata_cache
+                        if meta_cache and meta_cache.covers then
+                            meta_cache.covers[cache_key] = m.lastModified
+                            _cover_meta_dirty = true
+                        end
+                    else
+                        logger.warn(string.format("[Hybrid] cover async download failed for %s: code=%s err=%s",
+                            sanitizeLog(cache_key), sanitizeLog(code), sanitizeLog(err_msg)))
+                    end
+                    finishCoverStep(ok == true, m.key)
+                end)
+                if launched then
+                    return
+                end
             end
         end
-    end
 
-    local ok, path = pcall(plugin.cache.cacheThumbnail, plugin.cache,
-        m.type_label, m.id, m.lastModified, true)
-    finishCoverStep(ok and path ~= nil)
+        local ok, path = safeCall("processNextCover.cacheThumbnail", plugin.cache.cacheThumbnail, plugin.cache,
+            valid_type, valid_id, m.lastModified, true)
+        finishCoverStep(ok and path ~= nil, m.key)
+    end)
+
+    if not ok_step then
+        logger.err("[Hybrid] processNextCover unexpected error: " .. sanitizeLog(step_err))
+        finishCoverStep(false, m.key)
+    end
 end
 
 function M.scheduleKomgaCovers(records)
@@ -1445,8 +1553,8 @@ function M.scheduleKomgaCovers(records)
             local valid_id = validateKomgaId(id)
             if valid_id and not getKomgaCoverPath(type_label, valid_id) then
                 local key = type_label .. "_" .. valid_id
-                if not _komga_covers_attempted[key] then
-                    _komga_covers_attempted[key] = true
+                if canAttemptCover(key) then
+                    markCoverQueued(key)
                     _komga_covers_queue[#_komga_covers_queue + 1] = {
                         key = key,
                         type_label = type_label,
@@ -1462,8 +1570,8 @@ function M.scheduleKomgaCovers(records)
                 local b_id = validateKomgaId(rec.active_book.id)
                 if b_id and not getKomgaCoverPath("book", b_id) then
                     local key = "book_" .. b_id
-                    if not _komga_covers_attempted[key] then
-                        _komga_covers_attempted[key] = true
+                    if canAttemptCover(key) then
+                        markCoverQueued(key)
                         _komga_covers_queue[#_komga_covers_queue + 1] = {
                             key = key,
                             type_label = "book",
@@ -1946,11 +2054,31 @@ function M.getAllSeriesRecords(source, is_spine, force_refresh)
     return records, #records
 end
 
-function M.getKomgaSeriesBooks(series_id, series_title, series_summary, allow_network)
-    if not series_id then return {} end
+local function isHttp404(ok_res, resp, err)
+    if ok_res and type(resp) == "table" then
+        if resp.status == 404 or resp.code == 404 then return true end
+        if type(resp.error) == "string" and resp.error:lower() == "not found" then return true end
+    end
+    if not resp and type(err) == "string" then
+        local low = err:lower()
+        if low:find("404") or low:find("not found") then return true end
+    end
+    return false
+end
+
+local function fetchAndMapSeriesBooks(opts)
+    local series_id = validateKomgaId(opts and opts.series_id)
+    if not series_id then return { books = {}, purged = false } end
+    local series_title = opts.series_title
+    local series_summary = opts.series_summary
+    local allow_network = opts.allow_network
+    local check_spine_light = opts.check_spine_light == true
+
+    ensureKomgaApiPatched()
+
     local cached_items = nil
     local fetched_at = 0
-    pcall(function()
+    safeCall("fetchAndMapSeriesBooks.readCache", function()
         local DataStorage = require("datastorage")
         local LuaSettings = require("luasettings")
         local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
@@ -1980,25 +2108,26 @@ function M.getKomgaSeriesBooks(series_id, series_title, series_summary, allow_ne
         can_fetch = false
     end
 
-    local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
-    if (Repo and Repo.spine_light == true) and (not cached_items or #cached_items == 0) and allow_network ~= true then
-        -- During bulk Spines shelf expansion, avoid firing blocking synchronous network calls in a tight loop
-        can_fetch = false
+    if check_spine_light then
+        local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
+        if (Repo and Repo.spine_light == true) and (not cached_items or #cached_items == 0) and allow_network ~= true then
+            can_fetch = false
+        end
     end
 
     if is_cache_stale and can_fetch then
         local komga = getKomgaPlugin()
         local api = (komga and komga.api) or getKomgaApi()
-        if api then
-            local ok_res, resp = pcall(api.get_books_for_series, api, series_id,
-                { sort = "metadata.numberSort,asc" }, 0, 1000)
-            if not ok_res or not resp then
-                ok_res, resp = pcall(api.get_books_for_series, api, series_id, nil, 0, 1000)
-            end
-            local content = resp and (resp.content or (resp[1] and resp))
+        if api and type(api.get_books_for_series) == "function" then
+            local ok_res, resp, api_err = safeCall("fetchAndMapSeriesBooks.get_books_for_series",
+                api.get_books_for_series, api, series_id, { sort = "metadata.numberSort,asc" }, 0, 1000)
+            local content = ok_res and type(resp) == "table" and (resp.content or (resp[1] and resp)) or nil
             if content and #content > 0 then
+                if #content >= 1000 then
+                    logger.warn(string.format("[Hybrid] series %s hit 1000-book pagination cap", sanitizeLog(series_id)))
+                end
                 cached_items = trimBooks(content, 1000)
-                pcall(function()
+                safeCall("fetchAndMapSeriesBooks.persist", function()
                     local DataStorage = require("datastorage")
                     local LuaSettings = require("luasettings")
                     local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
@@ -2009,41 +2138,54 @@ function M.getKomgaSeriesBooks(series_id, series_title, series_summary, allow_ne
                         s:flush()
                     end
                 end)
-            elseif ok_res and resp and (resp.status == 404 or (type(resp) == "table" and (resp.error == "Not Found" or resp.totalElements == 0))) then
-                cached_items = {}
+            elseif isHttp404(ok_res, resp, api_err) then
                 M.purgeDeletedSeries(series_id, series_title)
+                return { books = {}, purged = true }
             end
         end
     end
 
     if not cached_items or #cached_items == 0 then
-        return {}
+        return { books = {}, purged = false }
     end
 
     local downloaded = Dedup.getDownloadedMap()
     local books = {}
     for _, dto in ipairs(cached_items) do
         local rec = bookDtoToRecord(dto, series_title, series_summary, downloaded)
-        rec.is_remote = not rec.downloaded
-        rec.source_kind = "hybrid"
-        local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title, series_id)
-        if not cp and series_id then
-            cp = getKomgaCoverPath("series", series_id, series_title)
+        if rec then
+            rec.is_remote = not rec.downloaded
+            rec.source_kind = "hybrid"
+            local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title, series_id)
+            if not cp and series_id then
+                cp = getKomgaCoverPath("series", series_id, series_title)
+            end
+            if cp then
+                rec.cover_image_path = cp
+                rec.has_cover = true
+            elseif rec.downloaded then
+                rec.has_cover = true
+            end
+            rec.label = rec.label or rec.title
+            rec.series_name = rec.series_name or series_title
+            rec.display_title = rec.display_title or rec.title
+            rec.page_count = (dto.media and dto.media.pagesCount and dto.media.pagesCount > 0 and dto.media.pagesCount) or 200
+            books[#books + 1] = rec
         end
-        if cp then
-            rec.cover_image_path = cp
-            rec.has_cover = true
-        elseif rec.downloaded then
-            rec.has_cover = true
-        end
-        rec.label = rec.label or rec.title
-        rec.series_name = rec.series_name or series_title
-        rec.display_title = rec.display_title or rec.title
-        rec.page_count = (dto.media and dto.media.pagesCount and dto.media.pagesCount > 0 and dto.media.pagesCount) or 200
-        books[#books + 1] = rec
     end
     M.scheduleKomgaCovers(books)
-    return books
+    return { books = books, purged = false }
+end
+
+function M.getKomgaSeriesBooks(series_id, series_title, series_summary, allow_network)
+    local res = fetchAndMapSeriesBooks({
+        series_id = series_id,
+        series_title = series_title,
+        series_summary = series_summary,
+        allow_network = allow_network,
+        check_spine_light = true,
+    })
+    return res.books
 end
 
 function M.expandSeriesToBooks(source, series_entry, sort_priority, local_folder_path)
@@ -2166,42 +2308,14 @@ function M.expandSeriesToBooks(source, series_entry, sort_priority, local_folder
         merged_books = remote_books
     end
 
-    -- Fallback if neither local nor remote books were loaded (e.g. offline/uncached)
+    -- Fallback if neither local nor remote books were loaded (only use real active_book DTO; never synthesize .jpg placeholder)
     if #merged_books == 0 then
         if series_entry.active_book then
             local downloaded = Dedup.getDownloadedMap()
-            merged_books = { bookDtoToRecord(series_entry.active_book, series_title, nil, downloaded) }
-        elseif series_entry.first_book then
-            local fb = series_entry.first_book
-            local fp = fb.filepath or fb.path or fb.fp or (folder_path and (folder_path .. "/cover.jpg")) or ("komga://series/" .. tostring(series_id or ""))
-            merged_books = {
-                {
-                    filepath = fp,
-                    title = fb.title or series_title,
-                    display_title = fb.title or series_title,
-                    series_name = series_title,
-                    cover_image_path = fb.cover_image_path,
-                    has_cover = fb.has_cover,
-                    page_count = fb.page_count or 200,
-                    kind = "book",
-                    source_kind = "hybrid",
-                }
-            }
+            local rec = bookDtoToRecord(series_entry.active_book, series_title, nil, downloaded)
+            if rec then merged_books = { rec } end
         else
-            local fp = (folder_path and (folder_path .. "/cover.jpg")) or ("komga://series/" .. tostring(series_id or ""))
-            merged_books = {
-                {
-                    filepath = fp,
-                    title = series_title,
-                    display_title = series_title,
-                    series_name = series_title,
-                    cover_image_path = series_entry.cover_image_path,
-                    has_cover = series_entry.has_cover,
-                    page_count = series_entry.page_count or 200,
-                    kind = "book",
-                    source_kind = "hybrid",
-                }
-            }
+            return {}
         end
     end
 
@@ -2263,93 +2377,21 @@ function M.getKomgaRecords(source, drill, is_spine)
         end
     end
 
-    -- 1. Drilling down into a series/collection
+    -- 1. Drilling down into a series/collection (delegates to shared fetchAndMapSeriesBooks)
     if drill and (drill.kind == "komga_series" or drill.kind == "series" or drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:find("^komga://series/"))) then
         local series_id = drill.series_id or drill.komga_series_id or (type(drill.path) == "string" and drill.path:match("^komga://series/(.+)$"))
-        local cached_items = nil
-        local fetched_at = 0
-        if series_id then
-            pcall(function()
-                local DataStorage = require("datastorage")
-                local LuaSettings = require("luasettings")
-                local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-                if s then
-                    local entries = s:readSetting("series") or {}
-                    local e = entries[series_id]
-                    if e and e.items and #e.items > 0 then
-                        cached_items = e.items
-                        fetched_at = tonumber(e.fetched_at) or 0
-                    end
-                end
-            end)
+        local res = fetchAndMapSeriesBooks({
+            series_id = series_id,
+            series_title = drill.label,
+            series_summary = drill.series_summary,
+            allow_network = true,
+            check_spine_light = false,
+        })
+        if res.purged then
+            return {}, 0
         end
-
-        local ttl = 180 -- 3 minutes TTL
-        local is_cache_stale = (not cached_items or #cached_items == 0) or ((os.time() - fetched_at) > ttl)
-        local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
-        local can_fetch = true
-        if ok_bh and BridgeHealth then
-            if BridgeHealth.isCircuitBreakerActive and BridgeHealth.isCircuitBreakerActive() then
-                can_fetch = false
-            elseif BridgeHealth.isServerReachable and not BridgeHealth.isServerReachable() then
-                can_fetch = false
-            end
-        end
-
-        if series_id and is_cache_stale and can_fetch then
-            local komga = getKomgaPlugin()
-            local api = (komga and komga.api) or getKomgaApi()
-            if api then
-                local ok_res, resp = pcall(api.get_books_for_series, api, series_id,
-                    { sort = "metadata.numberSort,asc" }, 0, 1000)
-                if not ok_res or not resp then
-                    ok_res, resp = pcall(api.get_books_for_series, api, series_id, nil, 0, 1000)
-                end
-                local content = resp and (resp.content or (resp[1] and resp))
-                if content and #content > 0 then
-                    cached_items = trimBooks(content, 1000)
-                    pcall(function()
-                        local DataStorage = require("datastorage")
-                        local LuaSettings = require("luasettings")
-                        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-                        if s then
-                            local entries = s:readSetting("series") or {}
-                            entries[series_id] = { fetched_at = os.time(), items = cached_items }
-                            s:saveSetting("series", entries)
-                            s:flush()
-                        end
-                    end)
-                elseif ok_res and resp and (resp.status == 404 or (type(resp) == "table" and (resp.error == "Not Found" or resp.totalElements == 0))) then
-                    cached_items = {}
-                    M.purgeDeletedSeries(series_id, drill.label)
-                end
-            end
-        end
-
-        if cached_items and #cached_items > 0 then
-            local downloaded = Dedup.getDownloadedMap()
-            local books = {}
-            for _, dto in ipairs(cached_items) do
-                local rec = bookDtoToRecord(dto, drill.label, drill.series_summary, downloaded)
-                rec.is_remote = not rec.downloaded
-                rec.source_kind = "hybrid"
-                local cp = rec.cover_image_path or getKomgaCoverPath("book", rec.komga_book_id or rec.komga_id, rec.title, series_id)
-                if not cp and series_id then
-                    cp = getKomgaCoverPath("series", series_id, drill.label)
-                end
-                if cp then
-                    rec.cover_image_path = cp
-                    rec.has_cover = true
-                elseif rec.downloaded then
-                    rec.has_cover = true
-                end
-                rec.label = rec.label or rec.title
-                rec.series_name = rec.series_name or drill.label
-                rec.display_title = rec.display_title or rec.title
-                books[#books + 1] = rec
-            end
-            M.scheduleKomgaCovers(books)
-            return books, #books
+        if res.books and #res.books > 0 then
+            return res.books, #res.books
         end
     end
 
@@ -2362,6 +2404,8 @@ function M.getKomgaRecords(source, drill, is_spine)
                 if ok and type(stats_or_err) == "table" and ((stats_or_err.pushed or 0) > 0 or (stats_or_err.pruned or 0) > 0) then
                     logger.info(string.format("[Hybrid] SyncQueue flush completed (%d pushed, %d pruned); active_queue refreshed",
                         stats_or_err.pushed or 0, stats_or_err.pruned or 0))
+                elseif not ok then
+                    logger.warn("[Hybrid] SyncQueue flush failed: " .. sanitizeLog(stats_or_err))
                 end
             end)
         end
@@ -3120,6 +3164,44 @@ function M.deleteDownloadedBook(book, local_path)
     return true
 end
 
+local function invalidateProgressCaches(clear_disk_active_queue)
+    _mem_all_series = {}
+    if clear_disk_active_queue then
+        safeCall("invalidateProgressCaches.clearActiveQueue", function()
+            local DataStorage = require("datastorage")
+            local LuaSettings = require("luasettings")
+            local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+            if s then
+                local lists = s:readSetting("lists")
+                if lists and lists["active_queue"] then
+                    lists["active_queue"] = nil
+                    s:saveSetting("lists", lists)
+                    s:flush()
+                end
+            end
+        end)
+    end
+    local ok_sp, HybridSpec = pcall(require, "lib/hybrid_spec")
+    if ok_sp and HybridSpec and HybridSpec.clearSeriesCache then
+        safeCall("invalidateProgressCaches.clearSeriesCache", HybridSpec.clearSeriesCache)
+    end
+end
+
+local function isTransientTransportError(err, is_unreachable)
+    if is_unreachable then return true end
+    if err == nil then return true end
+    local s = tostring(err):lower()
+    local patterns = {
+        "timeout", "timed out", "unreachable", "refused", "closed",
+        "reset", "broken pipe", "network is down", "no route",
+        "host not found", "502", "503", "504",
+    }
+    for _, pat in ipairs(patterns) do
+        if s:find(pat, 1, true) then return true end
+    end
+    return false
+end
+
 function M.setKomgaReadProgress(book_id, completed)
     local valid_id = validateKomgaId(book_id)
     if not valid_id then
@@ -3134,55 +3216,71 @@ function M.setKomgaReadProgress(book_id, completed)
         reachable = Health.isServerReachable()
     end
 
-    if not reachable then
+    local function enqueueOffline(reason)
         if ok_sq and SyncQueue and SyncQueue.enqueue then
-            SyncQueue.enqueue(completed and "progress" or "delete", book_id, { completed = completed })
+            local ok_enq, enq_res = safeCall("setKomgaReadProgress.enqueue", SyncQueue.enqueue,
+                completed and "progress" or "delete", book_id, { completed = completed })
+            if ok_enq and enq_res ~= false then
+                invalidateProgressCaches(false)
+                return false, "queued", reason
+            end
         end
-        return false, "offline"
+        return false, reason
+    end
+
+    if not reachable then
+        return enqueueOffline("offline")
     end
 
     local komga = getKomgaPlugin()
     local api = (komga and komga.api) or getKomgaApi()
     if not api then
-        if ok_sq and SyncQueue and SyncQueue.enqueue then
-            SyncQueue.enqueue(completed and "progress" or "delete", book_id, { completed = completed })
-        end
-        return false, "no_api"
+        return enqueueOffline("no_api")
     end
 
-    local success, err, is_unreachable
+    local ok_call, success, err, is_unreachable
     if completed then
-        if api.patch_read_progress then
-            success, err, is_unreachable = api:patch_read_progress(book_id, nil, true)
+        if type(api.patch_read_progress) == "function" then
+            ok_call, success, err, is_unreachable = safeCall("setKomgaReadProgress.patch_read_progress",
+                api.patch_read_progress, api, book_id, nil, true)
+        elseif type(api.request) == "function" then
+            ok_call, success, err, is_unreachable = safeCall("setKomgaReadProgress.patch",
+                api.request, api, "/api/v1/books/" .. book_id .. "/read-progress", "PATCH", { completed = true })
         else
-            success, err, is_unreachable = api:request("/api/v1/books/" .. tostring(book_id) .. "/read-progress", "PATCH", { completed = true })
+            return enqueueOffline("no_api_method")
         end
     else
-        success, err, is_unreachable = api:request("/api/v1/books/" .. tostring(book_id) .. "/read-progress", "DELETE")
+        if type(api.request) == "function" then
+            ok_call, success, err, is_unreachable = safeCall("setKomgaReadProgress.delete",
+                api.request, api, "/api/v1/books/" .. book_id .. "/read-progress", "DELETE")
+        else
+            return enqueueOffline("no_api_method")
+        end
+    end
+
+    if not ok_call then
+        err = success
+        success = false
+        is_unreachable = true
     end
 
     if not success then
-        local err_str = tostring(err):lower()
-        if is_unreachable or err_str:find("timeout") or err_str:find("unreachable") or err_str:find("refused") then
-            if ok_sq and SyncQueue and SyncQueue.enqueue then
-                SyncQueue.enqueue(completed and "progress" or "delete", book_id, { completed = completed })
-            end
+        if isTransientTransportError(err, is_unreachable) then
             if ok_h and Health and Health.tripCircuitBreaker then
-                Health.tripCircuitBreaker(err)
+                safeCall("setKomgaReadProgress.tripCircuitBreaker", Health.tripCircuitBreaker, err)
             end
+            return enqueueOffline(tostring(err or "transport_error"))
         end
         return false, err
     end
 
     if ok_sq and SyncQueue and SyncQueue.remove then
-        SyncQueue.remove(book_id)
+        safeCall("setKomgaReadProgress.remove", SyncQueue.remove, book_id)
     end
+    invalidateProgressCaches(true)
     return true
 end
 
 M.bookDtoToRecord = bookDtoToRecord
-M.getAllSeries = M.getAllSeries
-M.getAllSeriesRecords = M.getAllSeriesRecords
-M.purgeDeletedSeries = M.purgeDeletedSeries
 
 return M
