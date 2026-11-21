@@ -26,21 +26,29 @@ function HybridPlugin:registerWithBookshelf()
     if not (bookshelf and type(bookshelf.registerSource) == "function") then
         local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
         if ok_s and Sources and type(Sources.register) == "function" then
-            local ok, accepted = pcall(Sources.register, "hybrid", HybridSpec.SPEC)
+            local ok, accepted, reason = pcall(Sources.register, "hybrid", HybridSpec.SPEC)
             if ok and accepted then
                 logger.info("[Hybrid] Registered 'hybrid' source directly with BookshelfSources")
                 Patch.installAll()
                 return true
+            elseif not ok then
+                logger.warn("[Hybrid] Direct BookshelfSources.register threw:", tostring(accepted))
+            elseif reason then
+                logger.dbg("[Hybrid] Direct BookshelfSources.register declined:", tostring(reason))
             end
         end
         return false
     end
 
-    local ok, accepted = pcall(bookshelf.registerSource, bookshelf, "hybrid", HybridSpec.SPEC)
+    local ok, accepted, reason = pcall(bookshelf.registerSource, bookshelf, "hybrid", HybridSpec.SPEC)
     if ok and accepted then
         logger.info("[Hybrid] Registered 'hybrid' source with Bookshelf instance")
         Patch.installAll()
         return true
+    elseif not ok then
+        logger.warn("[Hybrid] bookshelf:registerSource threw:", tostring(accepted))
+    elseif reason then
+        logger.dbg("[Hybrid] bookshelf:registerSource declined:", tostring(reason))
     end
     return false
 end
@@ -48,7 +56,6 @@ end
 local _startup_checked = false
 local function checkStartupLaunch(self_p)
     if _startup_checked then return end
-    _startup_checked = true
 
     local is_enabled = false
     if _G.G_reader_settings then
@@ -61,9 +68,14 @@ local function checkStartupLaunch(self_p)
     if not (ok_ui and UIManager and UIManager.nextTick) then return end
 
     UIManager:nextTick(function()
-        if self_p.ui and self_p.ui.document then return end
+        if _startup_checked then return end
+        if self_p.ui and self_p.ui.document then
+            _startup_checked = true
+            return
+        end
         local bookshelf = (self_p.ui and self_p.ui.bookshelf) or liveModule("bookshelf")
         if bookshelf and type(bookshelf.show) == "function" then
+            _startup_checked = true
             if not (bookshelf._isShowing and bookshelf:_isShowing()) then
                 logger.info("[Hybrid] Launching Bookshelf on startup")
                 bookshelf:show()

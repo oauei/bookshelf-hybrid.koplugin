@@ -27,22 +27,29 @@ local function getBookTitle(book)
 end
 
 local function getBookId(book)
-    if not book then return nil end
-    return book.komga_book_id or book.komga_id
+    if type(book) ~= "table" then return nil end
+    local id = book.komga_book_id or book.komga_id
         or (type(book.filepath) == "string" and book.filepath:match("^komga://book/(.+)$"))
+    if type(id) == "string" and id ~= "" then return id end
+    if type(id) == "number" then return tostring(id) end
+    return nil
+end
+
+local function isSafeAbsPath(p)
+    return type(p) == "string" and p:sub(1, 1) == "/" and not p:find("%.%.", 1, true)
 end
 
 local function getDownloadedPath(book)
-    if not book then return nil end
+    if type(book) ~= "table" then return nil end
     local downloaded = Dedup.getDownloadedMap()
     local book_id = getBookId(book)
-    local rec_key = "komga://book/" .. tostring(book_id or "")
+    local rec_key = book_id and ("komga://book/" .. book_id) or nil
 
-    local p = downloaded[rec_key]
+    local p = (rec_key and downloaded[rec_key])
         or (type(book.filepath) == "string" and downloaded[book.filepath])
         or (type(book.filepath) == "string" and not book.filepath:find("^%a+://") and book.filepath)
 
-    if p and p ~= "" then
+    if isSafeAbsPath(p) then
         local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
         if ok_lfs and lfs and lfs.attributes and lfs.attributes(p, "mode") == "file" then
             return p
@@ -201,9 +208,12 @@ function M.startDownload(book, widget, opts)
     -- Check network connectivity
     local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
     if ok_net and NetworkMgr and NetworkMgr.isConnected and not NetworkMgr:isConnected() then
-        if NetworkMgr.promptWifiConnection then
+        if not opts._wifi_prompted and NetworkMgr.promptWifiConnection then
+            local retry_opts = {}
+            for k, v in pairs(opts) do retry_opts[k] = v end
+            retry_opts._wifi_prompted = true
             NetworkMgr:promptWifiConnection(function()
-                M.startDownload(book, widget, opts)
+                M.startDownload(book, widget, retry_opts)
             end)
             return
         else
@@ -212,16 +222,32 @@ function M.startDownload(book, widget, opts)
         end
     end
 
-    local dest_path = Remote.resolveDownloadDestination(book)
-
     if open_after then
         local notice = InfoMessage:new{
             text = T(_("Downloading %1..."), title),
         }
         UIManager:show(notice)
 
-        Remote.downloadKomgaBook(book, opts, function(downloaded_path)
-            pcall(function() if notice then UIManager:close(notice) end end)
+        local settled = false
+        local function closeNotice()
+            if notice then
+                local n = notice
+                notice = nil
+                pcall(function() UIManager:close(n) end)
+            end
+        end
+
+        local ok_call, res_or_err, err_detail = pcall(Remote.downloadKomgaBook, book, opts, function(downloaded_path)
+            settled = true
+            closeNotice()
+
+            if type(downloaded_path) ~= "string" or downloaded_path == "" then
+                logger.err("[Hybrid] Foreground download returned invalid path for", title)
+                UIManager:show(Notification:new{
+                    text = T(_("Download failed: %1"), "invalid path"),
+                })
+                return
+            end
 
             book.filepath = downloaded_path
             book.downloaded = true
@@ -240,11 +266,27 @@ function M.startDownload(book, widget, opts)
                 widget:_launchReader(downloaded_path, opts.after_open_callback)
             end
         end, function(err)
-            pcall(function() if notice then UIManager:close(notice) end end)
+            settled = true
+            closeNotice()
+            logger.err("[Hybrid] Foreground download failed:", tostring(err))
             UIManager:show(Notification:new{
                 text = T(_("Download failed: %1"), tostring(err or "Unknown error")),
             })
         end)
+
+        if not ok_call then
+            closeNotice()
+            logger.err("[Hybrid] Foreground download threw:", tostring(res_or_err))
+            UIManager:show(Notification:new{
+                text = T(_("Download failed: %1"), tostring(res_or_err or "Unknown error")),
+            })
+        elseif not settled and res_or_err == false then
+            closeNotice()
+            logger.err("[Hybrid] Foreground download rejected:", tostring(err_detail or "Unknown error"))
+            UIManager:show(Notification:new{
+                text = T(_("Download failed: %1"), tostring(err_detail or "Unknown error")),
+            })
+        end
     else
         -- Background Download
         UIManager:show(Notification:new{
@@ -252,7 +294,11 @@ function M.startDownload(book, widget, opts)
             timeout = 3,
         })
 
-        Remote.downloadKomgaBook(book, opts, function(path)
+        local ok_call, res_or_err = pcall(Remote.downloadKomgaBook, book, opts, function(path)
+            if type(path) ~= "string" or path == "" then
+                logger.err("[Hybrid] Background download returned invalid path for", title)
+                return
+            end
             book.filepath = path
             book.downloaded = true
             book.is_remote = false
@@ -276,6 +322,13 @@ function M.startDownload(book, widget, opts)
                 timeout = 5,
             })
         end)
+        if not ok_call then
+            logger.err("Background download threw:", tostring(res_or_err))
+            UIManager:show(Notification:new{
+                text = T(_("Download failed for %1: %2"), title, tostring(res_or_err or "Error")),
+                timeout = 5,
+            })
+        end
     end
 end
 
@@ -292,14 +345,21 @@ function M.toggleReadStatus(book, widget, mark_as_read)
 
     local title = getBookTitle(book)
     local ok, res = Remote.setKomgaReadProgress(book_id, mark_as_read)
-    if ok then
+    local is_queued = (not ok) and (res == "queued")
+    if ok or is_queued then
         book.status = mark_as_read and "finished" or "unread"
         book.read_status = book.status
         book.book_pct = mark_as_read and 1 or 0
         book.percent_finished = book.book_pct
 
-        local msg = mark_as_read and T(_("Marked '%1' as finished"), title)
-            or T(_("Marked '%1' as unread"), title)
+        local msg
+        if is_queued then
+            msg = mark_as_read and T(_("Marked '%1' as finished (queued for sync)"), title)
+                or T(_("Marked '%1' as unread (queued for sync)"), title)
+        else
+            msg = mark_as_read and T(_("Marked '%1' as finished"), title)
+                or T(_("Marked '%1' as unread"), title)
+        end
         UIManager:show(Notification:new{ text = msg, timeout = 3 })
 
         local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
@@ -310,10 +370,35 @@ function M.toggleReadStatus(book, widget, mark_as_read)
             UIManager:setDirty(widget, "ui")
         end
     else
+        logger.warn("[Hybrid] toggleReadStatus failed for book", tostring(book_id), tostring(res))
         UIManager:show(Notification:new{
             text = T(_("Failed to update status on Komga: %1"), tostring(res or "Error")),
         })
     end
+end
+
+local function formatAuthors(book)
+    if type(book) ~= "table" then return nil end
+    local raw = book.authors
+    local list = {}
+    if type(raw) == "string" and raw ~= "" then
+        list[1] = raw
+    elseif type(raw) == "table" then
+        for _, a in ipairs(raw) do
+            if type(a) == "string" and a ~= "" then
+                list[#list + 1] = a
+            elseif type(a) == "table" and type(a.name) == "string" and a.name ~= "" then
+                list[#list + 1] = a.name
+            end
+        end
+    end
+    if #list == 0 and type(book.author) == "string" and book.author ~= "" then
+        list[1] = book.author
+    end
+    if #list > 0 then
+        return table.concat(list, ", ")
+    end
+    return nil
 end
 
 function M.showBookDetails(book)
@@ -327,9 +412,9 @@ function M.showBookDetails(book)
         lines[#lines + 1] = T(_("Series: %1%2"), book.series_name, num)
     end
 
-    local authors = book.authors or (book.author and { book.author })
-    if authors and #authors > 0 then
-        lines[#lines + 1] = T(_("Authors: %1"), table.concat(authors, ", "))
+    local authors_str = formatAuthors(book)
+    if authors_str then
+        lines[#lines + 1] = T(_("Authors: %1"), authors_str)
     end
 
     local fmt = (book.format or book.ext or "CBZ"):upper()
@@ -364,6 +449,10 @@ function M.showBookDetails(book)
 end
 
 function M.confirmDelete(book, local_path, widget)
+    if type(local_path) ~= "string" or local_path == "" then
+        UIManager:show(Notification:new{ text = _("No local file to delete.") })
+        return
+    end
     local title = getBookTitle(book)
     local filename = local_path:match("([^/]+)$") or title
 
@@ -371,11 +460,14 @@ function M.confirmDelete(book, local_path, widget)
         text = T(_("Delete local file '%1'?\n\nThe remote entry will remain available on the shelf."), filename),
         ok_text = _("Delete"),
         ok_callback = function()
-            local success = Remote.deleteDownloadedBook(book, local_path)
+            local success, del_err = Remote.deleteDownloadedBook(book, local_path)
             if success then
                 book.downloaded = false
                 book.is_remote = true
-                book.filepath = "komga://book/" .. tostring(getBookId(book) or "")
+                local bid = getBookId(book)
+                if bid then
+                    book.filepath = "komga://book/" .. bid
+                end
 
                 UIManager:show(Notification:new{
                     text = T(_("Deleted local copy of %1"), title),
@@ -390,7 +482,10 @@ function M.confirmDelete(book, local_path, widget)
                     UIManager:setDirty(widget, "ui")
                 end
             else
-                UIManager:show(Notification:new{ text = _("Failed to delete local file.") })
+                logger.warn("[Hybrid] confirmDelete failed:", tostring(del_err))
+                UIManager:show(Notification:new{
+                    text = T(_("Failed to delete local file: %1"), tostring(del_err or "Error")),
+                })
             end
         end,
     })

@@ -89,16 +89,26 @@ function M.installWidgetPatch()
         return self_w._hybridTab and self_w:_hybridTab() or nil
     end
 
+    local function isHttpUrl(url)
+        return type(url) == "string" and url:match("^https?://[^%s]+$") ~= nil
+    end
+
     -- Hook _opdsEffectiveTab
     local orig_opdsEffectiveTab = BookshelfWidget._opdsEffectiveTab
     BookshelfWidget._opdsEffectiveTab = function(self_w)
         local path = self_w._drilldown_path or {}
         local tip = path[#path]
         if tip then
-            if tip.kind == "opds_nav" and tip.payload and tip.payload.feed_url then
+            if tip.kind == "opds_nav" and tip.payload and isHttpUrl(tip.payload.feed_url) then
+                local htab = self_w._hybridTab and self_w:_hybridTab() or nil
+                local bound_sk = htab and htab.source and (htab.source.server_key or htab.source.id)
                 return {
                     label = tip.label,
-                    source = { kind = "opds", id = tip.payload.server_key or "komga", feed_url = tip.payload.feed_url },
+                    source = {
+                        kind = "opds",
+                        id = bound_sk or tip.payload.server_key or "komga",
+                        feed_url = tip.payload.feed_url,
+                    },
                 }
             end
             if tip.kind == "source_nav" and tip.payload and tip.payload.source_kind == "hybrid" then
@@ -202,7 +212,8 @@ function M.installWidgetPatch()
                             label = tip.label,
                         }
                         local res_items, res_total = Repo.getBySource(src, nil, nil, offset, LIMIT, {})
-                        if (not res_items or #res_items == 0) and (not res_total or res_total == 0) and (series_id or (pay.drill and pay.drill.series_id)) then
+                        local is_next_book = (tab.source and tab.source.remote_mode == "next_book")
+                        if not is_next_book and (not res_items or #res_items == 0) and (not res_total or res_total == 0) and (series_id or (pay.drill and pay.drill.series_id)) then
                             local sid = series_id or (pay.drill and pay.drill.series_id)
                             local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
                             local reachable = (not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable())
@@ -211,14 +222,23 @@ function M.installWidgetPatch()
                                 if ok_rem and Remote and Remote.purgeDeletedSeries then
                                     Remote.purgeDeletedSeries(sid, tip.label)
                                 end
-                                -- Auto-eject: pop back to root shelf
-                                self_w._drilldown_path = {}
-                                self_w._cursor = 1
-                                self_w:_syncPageFromCursor()
+                                -- Auto-eject: defer drill-pop to nextTick to avoid mutating widget state mid-rebuild
                                 local ok_ui, UIManager = pcall(require, "ui/uimanager")
                                 local ok_notif, Notification = pcall(require, "ui/widget/notification")
-                                if ok_ui and UIManager and ok_notif and Notification then
-                                    UIManager:show(Notification:new{ text = _("Series no longer exists on Komga; returning to shelf.") })
+                                local function resetDrill()
+                                    self_w._drilldown_path = {}
+                                    self_w._cursor = 1
+                                    if self_w._syncPageFromCursor then
+                                        self_w:_syncPageFromCursor()
+                                    end
+                                    if ok_ui and UIManager and ok_notif and Notification then
+                                        UIManager:show(Notification:new{ text = _("Series no longer exists on Komga; returning to shelf.") })
+                                    end
+                                end
+                                if ok_ui and UIManager and UIManager.nextTick then
+                                    UIManager:nextTick(resetDrill)
+                                else
+                                    resetDrill()
                                 end
                                 local root_src = {}
                                 for k, v in pairs(tab.source) do root_src[k] = v end
@@ -228,10 +248,13 @@ function M.installWidgetPatch()
                         end
                         return res_items, res_total
                     end
+                    if pay.feed_url ~= nil and not isHttpUrl(pay.feed_url) then
+                        return {}, 0
+                    end
                     local drill = {
                         kind = "opds_nav",
                         feed_url = pay.feed_url,
-                        server_key = pay.server_key,
+                        server_key = (tab.source and (tab.source.server_key or tab.source.id)) or pay.server_key,
                         label = tip.label,
                     }
                     local src = {}
@@ -260,6 +283,10 @@ function M.installWidgetPatch()
     -- Hook _setOpdsStartFeed
     local orig_setOpdsStartFeed = BookshelfWidget._setOpdsStartFeed
     BookshelfWidget._setOpdsStartFeed = function(self_w, feed_url, label)
+        if feed_url ~= nil and not isHttpUrl(feed_url) then
+            logger.warn("[Hybrid] _setOpdsStartFeed rejected invalid feed_url")
+            return false
+        end
         local TabModel = require("lib/bookshelf_tab_model")
         local tabs = TabModel.load()
         local found = false
@@ -283,29 +310,46 @@ function M.installWidgetPatch()
     end
 
     local function isHybridBook(book)
-        if not book then return false end
+        if type(book) == "string" then
+            return book:find("^komga://") ~= nil
+        end
+        if type(book) ~= "table" then return false end
         if book.is_komga or book.komga_book_id or book.komga_dto then return true end
         if type(book.filepath) == "string" and book.filepath:find("^komga://") then return true end
         if book.source_kind == "hybrid" and (book.is_remote or (type(book.filepath) == "string" and book.filepath:find("^%a+://"))) then return true end
         return false
     end
 
+    local function resolveLocalHybridPath(book, downloaded)
+        local fp = type(book) == "string" and book or (type(book) == "table" and type(book.filepath) == "string" and book.filepath or nil)
+        local book_id
+        if type(book) == "table" then
+            book_id = book.komga_book_id or book.komga_id
+        end
+        if not book_id and fp then
+            book_id = fp:match("^komga://book/(.+)$")
+        end
+        if type(book_id) == "number" then book_id = tostring(book_id) end
+        local rec_key = (type(book_id) == "string" and book_id ~= "") and ("komga://book/" .. book_id) or nil
+
+        local local_path = (rec_key and downloaded[rec_key])
+            or (fp and downloaded[fp])
+            or (fp and not fp:find("^%a+://") and fp)
+        if type(local_path) ~= "string" or local_path == "" then
+            return nil, false
+        end
+        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+        local is_file = ok_lfs and lfs and lfs.attributes and lfs.attributes(local_path, "mode") == "file" or false
+        return local_path, is_file
+    end
+
     -- Hook _openBook for remote hybrid book action dialog
     local orig_openBook = BookshelfWidget._openBook
     BookshelfWidget._openBook = function(self_w, book, after_open_callback)
-        if isHybridBook(book) then
+        if type(book) == "table" and isHybridBook(book) then
             local ok_d, Dedup = pcall(require, "lib/hybrid_dedup")
             local downloaded = ok_d and Dedup and Dedup.getDownloadedMap and Dedup.getDownloadedMap() or {}
-            local book_id = book.komga_book_id or book.komga_id
-                or (type(book.filepath) == "string" and book.filepath:match("^komga://book/(.+)$"))
-            local rec_key = "komga://book/" .. tostring(book_id or "")
-
-            local local_path = downloaded[rec_key]
-                or (type(book.filepath) == "string" and downloaded[book.filepath])
-                or (type(book.filepath) == "string" and not book.filepath:find("^%a+://") and book.filepath)
-
-            local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-            local is_file = local_path and ok_lfs and lfs and lfs.attributes and lfs.attributes(local_path, "mode") == "file"
+            local local_path, is_file = resolveLocalHybridPath(book, downloaded)
 
             if is_file then
                 book.filepath = local_path
@@ -331,7 +375,7 @@ function M.installWidgetPatch()
     -- Hook _showBookDetail for hybrid book actions
     local orig_showBookDetail = BookshelfWidget._showBookDetail
     BookshelfWidget._showBookDetail = function(self_w, book, opts)
-        if isHybridBook(book) then
+        if type(book) == "table" and isHybridBook(book) then
             local ok_hd, HybridDialog = pcall(require, "lib/hybrid_dialog")
             if ok_hd and HybridDialog and HybridDialog.showBookActionDialog then
                 return HybridDialog.showBookActionDialog(book, self_w, nil, opts)
@@ -345,15 +389,17 @@ function M.installWidgetPatch()
     -- Hook _isRemoteRecord so Bookshelf doesn't treat remote komga items as missing local files
     local orig_isRemoteRecord = BookshelfWidget._isRemoteRecord
     BookshelfWidget._isRemoteRecord = function(self_w, book)
-        if isHybridBook(book) and (book.is_remote or (type(book.filepath) == "string" and book.filepath:find("^komga://"))) then
+        local is_remote_hybrid = false
+        if type(book) == "string" then
+            is_remote_hybrid = book:find("^komga://") ~= nil
+        elseif type(book) == "table" and isHybridBook(book) then
+            is_remote_hybrid = (book.is_remote == true) or (type(book.filepath) == "string" and book.filepath:find("^komga://") ~= nil)
+        end
+        if is_remote_hybrid then
             local ok_d, Dedup = pcall(require, "lib/hybrid_dedup")
             local downloaded = ok_d and Dedup and Dedup.getDownloadedMap and Dedup.getDownloadedMap() or {}
-            local book_id = book.komga_book_id or book.komga_id
-                or (type(book.filepath) == "string" and book.filepath:match("^komga://book/(.+)$"))
-            local rec_key = "komga://book/" .. tostring(book_id or "")
-            local local_path = downloaded[rec_key]
-                or (type(book.filepath) == "string" and downloaded[book.filepath])
-            if not local_path then
+            local _, is_file = resolveLocalHybridPath(book, downloaded)
+            if not is_file then
                 return true
             end
         end
@@ -501,16 +547,6 @@ function M.persistRemoteMode(draft, new_mode)
                         matched_tab = t
                         break
                     end
-                end
-            end
-        end
-
-        -- Match 4: fallback to first hybrid tab
-        if not matched_tab then
-            for _, t in ipairs(tabs) do
-                if t.source and t.source.kind == "hybrid" then
-                    matched_tab = t
-                    break
                 end
             end
         end
@@ -1057,8 +1093,9 @@ function M.installStartupPatch()
                 end
             end
 
-            local is_enabled = (G_reader_settings:readSetting("start_with") == "bookshelf")
-                or (G_reader_settings:isTrue("bookshelf_launch_on_startup"))
+            local gs = _G.G_reader_settings
+            local is_enabled = gs and ((gs:readSetting("start_with") == "bookshelf")
+                or (gs:isTrue("bookshelf_launch_on_startup"))) or false
 
             dialog = ButtonDialog:new{
                 title = "Bookshelf",
@@ -1068,15 +1105,17 @@ function M.installStartupPatch()
                             text = is_enabled and _("\xe2\x9c\x93 Launch Bookshelf on startup")
                                            or  _("Launch Bookshelf on startup"),
                             callback = closing(function()
+                                local settings = _G.G_reader_settings
+                                if not settings then return end
                                 local new_val = not is_enabled
                                 if new_val then
-                                    G_reader_settings:saveSetting("start_with", "bookshelf")
-                                    G_reader_settings:saveSetting("bookshelf_launch_on_startup", true)
+                                    settings:saveSetting("start_with", "bookshelf")
+                                    settings:saveSetting("bookshelf_launch_on_startup", true)
                                 else
-                                    G_reader_settings:saveSetting("start_with", "filemanager")
-                                    G_reader_settings:delSetting("bookshelf_launch_on_startup")
+                                    settings:saveSetting("start_with", "filemanager")
+                                    settings:delSetting("bookshelf_launch_on_startup")
                                 end
-                                G_reader_settings:flush()
+                                settings:flush()
                                 local ok_notif, Notification = pcall(require, "ui/widget/notification")
                                 local msg = new_val and _("Bookshelf will launch on startup")
                                                      or _("Bookshelf startup launch disabled")
@@ -1120,19 +1159,22 @@ function M.installStartupPatch()
         Settings._behaviourSubItems = function(self_s)
             local items = orig_behaviour(self_s) or {}
             local is_enabled = function()
-                return (G_reader_settings:readSetting("start_with") == "bookshelf")
-                    or (G_reader_settings:isTrue("bookshelf_launch_on_startup"))
+                local gs = _G.G_reader_settings
+                return gs and ((gs:readSetting("start_with") == "bookshelf")
+                    or (gs:isTrue("bookshelf_launch_on_startup"))) or false
             end
             local toggle_startup = function(touchmenu_instance)
+                local gs = _G.G_reader_settings
+                if not gs then return end
                 local new_val = not is_enabled()
                 if new_val then
-                    G_reader_settings:saveSetting("start_with", "bookshelf")
-                    G_reader_settings:saveSetting("bookshelf_launch_on_startup", true)
+                    gs:saveSetting("start_with", "bookshelf")
+                    gs:saveSetting("bookshelf_launch_on_startup", true)
                 else
-                    G_reader_settings:saveSetting("start_with", "filemanager")
-                    G_reader_settings:delSetting("bookshelf_launch_on_startup")
+                    gs:saveSetting("start_with", "filemanager")
+                    gs:delSetting("bookshelf_launch_on_startup")
                 end
-                G_reader_settings:flush()
+                gs:flush()
                 if touchmenu_instance and touchmenu_instance.updateItems then
                     touchmenu_instance:updateItems()
                 end
@@ -1183,49 +1225,56 @@ function M.installSpineShelfPatch()
     -- 2. Hook SpineShelf.bookLook to sample cover tone and aspect from cached cover image
     local orig_bookLook = SpineShelf.bookLook
     SpineShelf.bookLook = function(book)
-        local fp = book and (book.cover_image_path or (book.first_book and book.first_book.cover_image_path))
-        if fp and (book.is_remote or book.source_kind == "hybrid" or book.is_komga or not book.filepath or (type(book.filepath) == "string" and book.filepath:find("^%a+://"))) then
+        local fp = type(book) == "table" and (book.cover_image_path or (book.first_book and book.first_book.cover_image_path)) or nil
+        if type(fp) == "string" and fp ~= "" and (book.is_remote or book.source_kind == "hybrid" or book.is_komga or not book.filepath or (type(book.filepath) == "string" and book.filepath:find("^%a+://"))) then
             local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
             if ok_lfs and lfs and lfs.attributes and lfs.attributes(fp, "mode") == "file" then
                 local ok_ri, RenderImage = pcall(require, "ui/renderimage")
                 if ok_ri and RenderImage and RenderImage.renderImageFile then
                     local ok_bb, bb = pcall(RenderImage.renderImageFile, RenderImage, fp, 60, 90)
                     if ok_bb and bb then
-                        local w, h = bb:getWidth(), bb:getHeight()
-                        local aspect = (w and h and w > 0) and (h / w) or 1.5
-                        local n, r, g, b = 0, 0, 0, 0
-                        local steps = 8
-                        for sy = 0, steps - 1 do
-                            for sx = 0, steps - 1 do
-                                local px = math.floor((sx + 0.5) * w / steps)
-                                local py = math.floor((sy + 0.5) * h / steps)
-                                local p = bb:getPixel(px, py)
-                                local c = p and p.getColorRGB32 and p:getColorRGB32() or nil
-                                if c then
-                                    n = n + 1
-                                    r = r + c.r; g = g + c.g; b = b + c.b
+                        local sampled_result = nil
+                        local ok_sample = pcall(function()
+                            local w, h = bb:getWidth(), bb:getHeight()
+                            if not (w and h and w > 1 and h > 1) then return end
+                            local aspect = h / w
+                            local n, r, g, b = 0, 0, 0, 0
+                            local steps = 8
+                            for sy = 0, steps - 1 do
+                                for sx = 0, steps - 1 do
+                                    local px = math.min(w - 1, math.floor((sx + 0.5) * w / steps))
+                                    local py = math.min(h - 1, math.floor((sy + 0.5) * h / steps))
+                                    local p = bb:getPixel(px, py)
+                                    local c = p and p.getColorRGB32 and p:getColorRGB32() or nil
+                                    if c then
+                                        n = n + 1
+                                        r = r + c.r; g = g + c.g; b = b + c.b
+                                    end
                                 end
                             end
-                        end
-                        if bb.free then bb:free() end
-                        if n > 0 then
-                            r = math.floor(r / n + 0.5)
-                            g = math.floor(g / n + 0.5)
-                            b = math.floor(b / n + 0.5)
-                            local luma = 0.299 * r + 0.587 * g + 0.114 * b
-                            if luma > 180 and luma > 0 then
-                                local factor = 180 / luma
-                                r = math.floor(r * factor + 0.5)
-                                g = math.floor(g * factor + 0.5)
-                                b = math.floor(b * factor + 0.5)
+                            if n > 0 then
+                                r = math.floor(r / n + 0.5)
+                                g = math.floor(g / n + 0.5)
+                                b = math.floor(b / n + 0.5)
+                                local luma = 0.299 * r + 0.587 * g + 0.114 * b
+                                if luma > 110 and luma > 0 then
+                                    local factor = 110 / luma
+                                    r = math.floor(r * factor + 0.5)
+                                    g = math.floor(g * factor + 0.5)
+                                    b = math.floor(b * factor + 0.5)
+                                end
+                                sampled_result = { r = r, g = g, b = b, aspect = aspect, sampled = true }
                             end
-                            return { r = r, g = g, b = b, aspect = aspect, sampled = true }
+                        end)
+                        if bb.free then pcall(bb.free, bb) end
+                        if ok_sample and sampled_result then
+                            return sampled_result
                         end
                     end
                 end
             end
         end
-        return orig_bookLook(book)
+        return orig_bookLook and orig_bookLook(book) or nil
     end
 
     -- 3. Hook SpineBookSlot gesture dispatch
@@ -1238,7 +1287,7 @@ function M.installSpineShelfPatch()
             local cbs = self_slot.callbacks
             -- Real book records always dispatch to native book callbacks (hero selection, open)
             if item and not item.is_folder and not item.is_opds_nav and item.kind ~= "folder" and item.kind ~= "opds_nav" and item.filepath then
-                return orig_onTap(self_slot, arg, ges)
+                return orig_onTap and orig_onTap(self_slot, arg, ges) or false
             end
             if cbs and item and (item.is_folder or item.kind == "folder" or item.kind == "opds_nav" or item.is_opds_nav) then
                 local cb = nil
@@ -1253,7 +1302,7 @@ function M.installSpineShelfPatch()
                     return true
                 end
             end
-            return orig_onTap(self_slot, arg, ges)
+            return orig_onTap and orig_onTap(self_slot, arg, ges) or false
         end
 
         local orig_onHold = Slot.onHold
@@ -1262,7 +1311,7 @@ function M.installSpineShelfPatch()
             local cbs = self_slot.callbacks
             -- Real book records always dispatch to native book hold callback
             if item and not item.is_folder and not item.is_opds_nav and item.kind ~= "folder" and item.kind ~= "opds_nav" and item.filepath then
-                return orig_onHold(self_slot)
+                return orig_onHold and orig_onHold(self_slot) or false
             end
             if cbs and item and (item.is_folder or item.kind == "folder" or item.kind == "opds_nav" or item.is_opds_nav) then
                 local cb = nil
@@ -1276,7 +1325,7 @@ function M.installSpineShelfPatch()
                     return true
                 end
             end
-            return orig_onHold(self_slot)
+            return orig_onHold and orig_onHold(self_slot) or false
         end
     end
 
@@ -1316,7 +1365,7 @@ function M.installSpineShelfPatch()
                         local entry = records[i]
                         if entry.is_folder or entry.kind == "folder" or entry.is_series or entry.komga_series_id or (type(entry.path) == "string" and entry.path:find("^komga://series/")) then
                             if ok_rem and Remote and Remote.expandSeriesToBooks then
-                                local books = Remote.expandSeriesToBooks(source, entry, nil, nil)
+                                local books = Remote.expandSeriesToBooks(source, entry, nil, nil) or {}
                                 for _, b in ipairs(books) do
                                     local k = spineKey(b)
                                     if not k or not seen_spine_keys[k] then
@@ -1364,10 +1413,11 @@ function M.installSpineShelfPatch()
                 Sources._spine_register_hooked = true
                 local orig_reg = Sources.register
                 Sources.register = function(kind, spec)
-                    orig_reg(kind, spec)
-                    if kind == "komga" or kind == "opds" then
+                    local ok, reason = orig_reg(kind, spec)
+                    if ok and (kind == "komga" or kind == "opds") then
                         wrapSpec(kind, spec)
                     end
+                    return ok, reason
                 end
             end
         end
