@@ -7,6 +7,117 @@ local M = {}
 
 local MAX_NORMALIZE_LEN = 512
 
+-- ---------------------------------------------------------------------------
+-- Fetch scope + short-TTL file existence cache.
+-- Large series drills used to repeat sidecar parses, sync-queue loads and
+-- SD-card stat calls per book on the UI thread (ANR). Inside a fetch scope each
+-- of those is done at most once; outside a scope behaviour is unchanged.
+-- ---------------------------------------------------------------------------
+local _scope = nil
+local EXISTS_TTL = 60
+local EXISTS_MAX = 4000
+local _exists_cache = {}
+local _exists_count = 0
+
+function M.beginFetchScope()
+    if _scope then
+        _scope.depth = _scope.depth + 1
+        return
+    end
+    _scope = { progress = {}, series_idx = {}, doc_settings = {}, queue = nil, queue_loaded = false, depth = 1 }
+end
+
+local scheduleStaleDownloadsPrune
+
+function M.endFetchScope()
+    local scope = _scope
+    if not scope then return end
+    scope.depth = scope.depth - 1
+    if scope.depth > 0 then return end
+    _scope = nil
+    if scope.prune_ids and #scope.prune_ids > 0 then
+        local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+        if ok_sq and SyncQueue and SyncQueue.removeMultiple then
+            pcall(SyncQueue.removeMultiple, scope.prune_ids)
+        end
+    end
+    if scope.saw_missing_file and scheduleStaleDownloadsPrune then
+        scheduleStaleDownloadsPrune()
+    end
+end
+
+-- Stale sync-queue prune: batched into one removeMultiple (one flush) per fetch scope.
+function M.deferSyncQueueRemove(book_id)
+    if not book_id then return end
+    if _scope then
+        _scope.prune_ids = _scope.prune_ids or {}
+        _scope.prune_seen = _scope.prune_seen or {}
+        local k = tostring(book_id)
+        if not _scope.prune_seen[k] then
+            _scope.prune_seen[k] = true
+            _scope.prune_ids[#_scope.prune_ids + 1] = k
+        end
+        return
+    end
+    local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+    if ok_sq and SyncQueue and SyncQueue.remove then
+        pcall(SyncQueue.remove, book_id)
+    end
+end
+
+function M.inFetchScope()
+    return _scope ~= nil
+end
+
+function M.invalidateFileExistsCache()
+    _exists_cache = {}
+    _exists_count = 0
+end
+
+-- TTL-cached "is regular file" probe (one lfs.attributes per path per TTL).
+function M.fileExists(p)
+    if type(p) ~= "string" or p == "" then return false end
+    local now = os.time()
+    local e = _exists_cache[p]
+    if e and (now - e.ts) < EXISTS_TTL then return e.ok end
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local ok
+    if ok_lfs and lfs and lfs.attributes then
+        local ok_a, mode = pcall(lfs.attributes, p, "mode")
+        ok = ok_a and mode == "file"
+    else
+        ok = true -- no lfs available: assume present (matches previous behaviour)
+    end
+    if _exists_count >= EXISTS_MAX then
+        _exists_cache = {}
+        _exists_count = 0
+    end
+    if not _exists_cache[p] then _exists_count = _exists_count + 1 end
+    _exists_cache[p] = { ok = ok, ts = now }
+    if not ok and _scope then
+        _scope.saw_missing_file = true
+    end
+    return ok
+end
+
+-- One SyncQueue.getQueue() per fetch scope (nil outside a scope => caller loads itself).
+function M.scopedSyncQueue()
+    local function load()
+        local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
+        if ok_sq and SyncQueue and SyncQueue.getQueue then
+            local ok_q, q = pcall(SyncQueue.getQueue)
+            if ok_q and type(q) == "table" then return q end
+        end
+        return nil
+    end
+    if not _scope then return load() end
+    if not _scope.queue_loaded then
+        _scope.queue = load()
+        _scope.queue_loaded = true
+    end
+    return _scope.queue
+end
+
 local function asFiniteNumber(v)
     local n = tonumber(v)
     if type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge then
@@ -144,7 +255,28 @@ function M.bookKey(rec)
     return M.nameKey(value)
 end
 
-local function checkLocalReadingProgress(filepath)
+local function scopedOpenDocSettings(filepath)
+    if type(filepath) ~= "string" or filepath == "" then return nil end
+    if _scope then
+        local cached = _scope.doc_settings[filepath]
+        if cached ~= nil then
+            return cached or nil
+        end
+    end
+    local ok_ds, DocSettings = pcall(require, "docsettings")
+    if not (ok_ds and DocSettings and DocSettings.open) then
+        if _scope then _scope.doc_settings[filepath] = false end
+        return nil
+    end
+    local ok_o, ds = pcall(DocSettings.open, DocSettings, filepath)
+    local res = (ok_o and ds) or nil
+    if _scope then
+        _scope.doc_settings[filepath] = res or false
+    end
+    return res
+end
+
+local function checkLocalReadingProgressRaw(filepath)
     if not filepath or type(filepath) ~= "string" or filepath:find("^%a+://") then
         return nil, nil
     end
@@ -163,21 +295,33 @@ local function checkLocalReadingProgress(filepath)
     end
 
     -- 2. Fallback to DocSettings.open if not in memory cache
-    local ok_ds, DocSettings = pcall(require, "docsettings")
-    if ok_ds and DocSettings and DocSettings.open then
-        local ok_o, ds = pcall(DocSettings.open, DocSettings, filepath)
-        if ok_o and ds and ds.readSetting then
-            local summary = ds:readSetting("summary")
-            local pct = asFiniteNumber(ds:readSetting("percent_finished"))
-            if (summary and type(summary) == "table" and summary.status == "complete") or (pct and pct >= 0.99) then
-                return "finished", 1.0
-            elseif (summary and type(summary) == "table" and summary.status == "reading") or (pct and pct > 0) then
-                return "reading", pct or 0
-            end
+    local ds = scopedOpenDocSettings(filepath)
+    if ds and ds.readSetting then
+        local summary = ds:readSetting("summary")
+        local pct = asFiniteNumber(ds:readSetting("percent_finished"))
+        if (summary and type(summary) == "table" and summary.status == "complete") or (pct and pct >= 0.99) then
+            return "finished", 1.0
+        elseif (summary and type(summary) == "table" and summary.status == "reading") or (pct and pct > 0) then
+            return "reading", pct or 0
         end
     end
     return nil, nil
 end
+
+local function checkLocalReadingProgress(filepath)
+    if _scope and type(filepath) == "string" then
+        local hit = _scope.progress[filepath]
+        if hit ~= nil then
+            if hit == false then return nil, nil end
+            return hit[1], hit[2]
+        end
+        local st, pct = checkLocalReadingProgressRaw(filepath)
+        _scope.progress[filepath] = st and { st, pct } or false
+        return st, pct
+    end
+    return checkLocalReadingProgressRaw(filepath)
+end
+M.checkLocalReadingProgress = checkLocalReadingProgress
 
 local function parseChapterFromString(str)
     if type(str) ~= "string" or str == "" then return nil end
@@ -261,21 +405,26 @@ function M.extractChapterNumber(rec)
     -- 4. DocSettings sidecar properties (only on verified local paths)
     local fp = rec.filepath or rec.path
     if not rec.is_remote and isSafeLocalFilePath(fp) then
-        local ok_ds, DocSettings = pcall(require, "docsettings")
-        if ok_ds and DocSettings and DocSettings.open then
-            local ok_o, ds = pcall(DocSettings.open, DocSettings, fp)
-            if ok_o and ds and ds.readSetting then
-                local dp = ds:readSetting("doc_props")
-                if type(dp) == "table" then
-                    local s_idx = asFiniteNumber(dp.series_index)
-                    if s_idx then return s_idx end
-                end
+        local cached_idx = _scope and _scope.series_idx[fp]
+        if cached_idx ~= nil then
+            if cached_idx then return cached_idx end
+        else
+        local found_idx = nil
+        local ds = scopedOpenDocSettings(fp)
+        if ds and ds.readSetting then
+            local dp = ds:readSetting("doc_props")
+            if type(dp) == "table" then
+                found_idx = asFiniteNumber(dp.series_index)
+            end
+            if not found_idx then
                 local cp = ds:readSetting("custom_props")
                 if type(cp) == "table" then
-                    local s_idx = asFiniteNumber(cp.series_index)
-                    if s_idx then return s_idx end
+                    found_idx = asFiniteNumber(cp.series_index)
                 end
             end
+        end
+        if _scope then _scope.series_idx[fp] = found_idx or false end
+        if found_idx then return found_idx end
         end
     end
 
@@ -340,24 +489,22 @@ function M.syncLocalChapterStatus(local_rec, frontier_dto)
     -- Update .sdr sidecar on disk if verified local file
     local filepath = local_rec.filepath or local_rec.path
     if isSafeLocalFilePath(filepath) then
-        local ok_ds, DocSettings = pcall(require, "docsettings")
-        if ok_ds and DocSettings and DocSettings.open then
-            local ok_o, ds = pcall(DocSettings.open, DocSettings, filepath)
-            if ok_o and ds and ds.readSetting then
-                local summary = ds:readSetting("summary")
-                if type(summary) ~= "table" then summary = {} end
-                local current_pct = asFiniteNumber(ds:readSetting("percent_finished")) or 0
-                if summary.status ~= "complete" or current_pct < 1.0 then
-                    summary.status = "complete"
-                    summary.modified = os.date("%Y-%m-%d")
-                    if ds.saveSetting then
-                        ds:saveSetting("summary", summary)
-                        ds:saveSetting("percent_finished", 1.0)
-                    end
-                    if ds.flush then pcall(ds.flush, ds) end
+        local ds = scopedOpenDocSettings(filepath)
+        if ds and ds.readSetting then
+            local summary = ds:readSetting("summary")
+            if type(summary) ~= "table" then summary = {} end
+            local current_pct = asFiniteNumber(ds:readSetting("percent_finished")) or 0
+            if summary.status ~= "complete" or current_pct < 1.0 then
+                summary.status = "complete"
+                summary.modified = os.date("%Y-%m-%d")
+                if ds.saveSetting then
+                    ds:saveSetting("summary", summary)
+                    ds:saveSetting("percent_finished", 1.0)
                 end
+                if ds.flush then pcall(ds.flush, ds) end
             end
         end
+        if _scope then _scope.progress[filepath] = { "finished", 1.0 } end
 
         updateBookListCache(filepath, "complete", 1.0)
     end
@@ -370,12 +517,84 @@ local _downloaded_map_time = 0
 local _cached_mbc_ref = nil
 local _cached_mbc_count = 0
 local DOWNLOADED_MAP_TTL = 30 -- 30 seconds TTL
+local PRUNE_COOLDOWN = 600 -- 10 minutes rate limit for deferred opds_downloads prune
+local _last_prune_time = 0
+local _prune_scheduled = false
+
+local function getKokomgaDownloadDir()
+    local ok_p, PluginLoader = pcall(require, "pluginloader")
+    local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
+    local komga = loaded and loaded["kokomga"] or nil
+    if komga and komga.getDownloadDir then
+        local ok_d, d = pcall(komga.getDownloadDir, komga)
+        if ok_d and type(d) == "string" and d ~= "" then
+            return d:gsub("/+$", "")
+        end
+    end
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    local ok_ls, LuaSettings = pcall(require, "luasettings")
+    if ok_ds and ok_ls and DataStorage and LuaSettings then
+        local ok_k, ks = pcall(LuaSettings.open, LuaSettings, DataStorage:getSettingsDir() .. "/kokomga.lua")
+        if ok_k and ks and ks.readSetting then
+            local d = ks:readSetting("download_dir")
+            if type(d) == "string" and d ~= "" then
+                return d:gsub("/+$", "")
+            end
+        end
+    end
+    return nil
+end
+
+local function isUnderDir(path, base_dir)
+    if type(path) ~= "string" or type(base_dir) ~= "string" or base_dir == "" then return false end
+    local np = path:gsub("//+", "/"):gsub("/+$", "")
+    local nb = base_dir:gsub("//+", "/"):gsub("/+$", "")
+    return np == nb or np:sub(1, #nb + 1) == nb .. "/"
+end
+
+scheduleStaleDownloadsPrune = function()
+    if _prune_scheduled then return end
+    local now = os.time()
+    if _last_prune_time > 0 and (now - _last_prune_time) < PRUNE_COOLDOWN then
+        return
+    end
+    local ok_ui, UIManager = pcall(require, "ui/uimanager")
+    if not (ok_ui and UIManager and UIManager.scheduleIn) then
+        return
+    end
+    _prune_scheduled = true
+    UIManager:scheduleIn(2, function()
+        _prune_scheduled = false
+        _last_prune_time = os.time()
+        local dl_dir = getKokomgaDownloadDir()
+        if not dl_dir then return end
+        local ok_s, Store = pcall(require, "lib/bookshelf_settings_store")
+        if not (ok_s and Store and Store.read and Store.save) then return end
+        local map = Store.read("opds_downloads")
+        if type(map) ~= "table" then return end
+        local pruned = 0
+        for k, local_path in pairs(map) do
+            if type(local_path) == "string" and isUnderDir(local_path, dl_dir) and not M.fileExists(local_path) then
+                map[k] = nil
+                if _downloaded_map_cache then
+                    _downloaded_map_cache[k] = nil
+                end
+                pruned = pruned + 1
+            end
+        end
+        if pruned > 0 then
+            pcall(Store.save, "opds_downloads", map)
+            logger.info(string.format("[Hybrid] Pruned %d stale opds_downloads entries under %s", pruned, dl_dir))
+        end
+    end)
+end
 
 function M.invalidateDownloadedMap()
     _downloaded_map_cache = nil
     _downloaded_map_time = 0
     _cached_mbc_ref = nil
     _cached_mbc_count = 0
+    M.invalidateFileExistsCache()
 end
 
 function M.getDownloadedMap(force_refresh)
@@ -397,6 +616,7 @@ function M.getDownloadedMap(force_refresh)
     end
 
     local downloaded = {}
+    local saw_stale = false
 
     -- 1. Bookshelf's own OPDS download map
     local ok_s, Store = pcall(require, "lib/bookshelf_settings_store")
@@ -405,16 +625,18 @@ function M.getDownloadedMap(force_refresh)
         if type(map) == "table" then
             for filepath, local_path in pairs(map) do
                 if type(filepath) == "string" and type(local_path) == "string" and local_path ~= "" then
-                    downloaded[filepath] = local_path
+                    local known = _exists_cache[local_path]
+                    if known and (now - known.ts) < EXISTS_TTL and not known.ok then
+                        saw_stale = true
+                    else
+                        downloaded[filepath] = local_path
+                    end
                 end
             end
         end
     end
 
     -- 2. Kokomga's OPDS download map
-    local ok_p, PluginLoader = pcall(require, "pluginloader")
-    local loaded = ok_p and PluginLoader and PluginLoader.loaded_plugins or nil
-    local komga = loaded and loaded["kokomga"] or nil
     if komga and komga.getOpdsDownloadsPath then
         local ok_ls, LuaSettings = pcall(require, "luasettings")
         if ok_ls and LuaSettings then
@@ -424,7 +646,10 @@ function M.getDownloadedMap(force_refresh)
                 if type(downloads) == "table" then
                     for filepath, local_path in pairs(downloads) do
                         if type(filepath) == "string" and type(local_path) == "string" and local_path ~= "" then
-                            downloaded[filepath] = local_path
+                            local known = _exists_cache[local_path]
+                            if not (known and (now - known.ts) < EXISTS_TTL and not known.ok) then
+                                downloaded[filepath] = local_path
+                            end
                         end
                     end
                 end
@@ -445,11 +670,9 @@ function M.getDownloadedMap(force_refresh)
         end
     end
     if type(mbc) == "table" then
-        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
         for local_fp, book_id in pairs(mbc) do
             if type(local_fp) == "string" and type(book_id) == "string" and book_id ~= "" then
-                local exists = not (ok_lfs and lfs and lfs.attributes) or lfs.attributes(local_fp, "mode") == "file"
-                if exists then
+                if M.fileExists(local_fp) then
                     local id_str = tostring(book_id)
                     downloaded["komga://book/" .. id_str] = local_fp
                     downloaded[id_str] = local_fp
@@ -457,6 +680,10 @@ function M.getDownloadedMap(force_refresh)
                 end
             end
         end
+    end
+
+    if saw_stale then
+        scheduleStaleDownloadsPrune()
     end
 
     _downloaded_map_cache = downloaded
@@ -681,24 +908,22 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
 
                             local fp = local_book.filepath or local_book.path
                             if isSafeLocalFilePath(fp) then
-                                local ok_ds, DocSettings = pcall(require, "docsettings")
-                                if ok_ds and DocSettings and DocSettings.open then
-                                    local ok_o, ds = pcall(DocSettings.open, DocSettings, fp)
-                                    if ok_o and ds and ds.readSetting then
-                                        local summary = ds:readSetting("summary")
-                                        if type(summary) ~= "table" then summary = {} end
-                                        local current_pct = asFiniteNumber(ds:readSetting("percent_finished")) or 0
-                                        if summary.status ~= "complete" or current_pct < 1.0 then
-                                            summary.status = "complete"
-                                            summary.modified = os.date("%Y-%m-%d")
-                                            if ds.saveSetting then
-                                                ds:saveSetting("summary", summary)
-                                                ds:saveSetting("percent_finished", 1.0)
-                                            end
-                                            if ds.flush then pcall(ds.flush, ds) end
+                                local ds = scopedOpenDocSettings(fp)
+                                if ds and ds.readSetting then
+                                    local summary = ds:readSetting("summary")
+                                    if type(summary) ~= "table" then summary = {} end
+                                    local current_pct = asFiniteNumber(ds:readSetting("percent_finished")) or 0
+                                    if summary.status ~= "complete" or current_pct < 1.0 then
+                                        summary.status = "complete"
+                                        summary.modified = os.date("%Y-%m-%d")
+                                        if ds.saveSetting then
+                                            ds:saveSetting("summary", summary)
+                                            ds:saveSetting("percent_finished", 1.0)
                                         end
+                                        if ds.flush then pcall(ds.flush, ds) end
                                     end
                                 end
+                                if _scope then _scope.progress[fp] = { "finished", 1.0 } end
                                 updateBookListCache(fp, "complete", 1.0)
                             end
                         end
@@ -712,8 +937,7 @@ function M.mergeRecords(local_records, remote_records, frontier_dto)
 
             if not duplicate_local_folder and not duplicate_local_book and not duplicate_remote then
                 if downloaded_here and downloaded_path then
-                    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-                    if not (ok_lfs and lfs and lfs.attributes) or lfs.attributes(downloaded_path, "mode") == "file" then
+                    if M.fileExists(downloaded_path) then
                         rec.filepath = downloaded_path
                         rec.downloaded = true
                         rec.is_remote = false

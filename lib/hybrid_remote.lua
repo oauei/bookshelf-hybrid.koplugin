@@ -617,6 +617,7 @@ function M.clearAllSeriesCache(lib_key)
 end
 
 function M.purgeDeletedSeries(series_id, series_title)
+    if M.invalidateSeriesMemo then M.invalidateSeriesMemo() end
     if not series_id and not series_title then return false end
     local sid_str = series_id and validateKomgaId(series_id) or nil
     if series_id and not sid_str then
@@ -950,22 +951,7 @@ function M.getKomgaCoverPath(type_label, id, title, fallback_id)
             local entries = getDirEntries(dir)
             if entries == false then return false end
             if type(entries) == "table" then
-                if entries[fname] == true then
-                    return true
-                elseif entries[fname] == false then
-                    return false
-                end
-                local is_file = false
-                if ok_lfs and lfs and lfs.attributes then
-                    local ok_a, m = pcall(lfs.attributes, p, "mode")
-                    is_file = ok_a and m == "file"
-                end
-                if not is_file then
-                    local f = io.open(p, "rb")
-                    if f then f:close(); is_file = true end
-                end
-                entries[fname] = is_file
-                return is_file
+                return entries[fname] == true
             end
         end
         if ok_lfs and lfs and lfs.attributes then
@@ -1079,8 +1065,7 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
     local rec_key = id_str and ("komga://book/" .. id_str) or "komga://book/"
     local local_path = id_str and (downloaded[rec_key] or downloaded[id_str]) or nil
 
-    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-    if local_path and ok_lfs and lfs and lfs.attributes and lfs.attributes(local_path, "mode") ~= "file" then
+    if local_path and not Dedup.fileExists(local_path) then
         local_path = nil
     end
 
@@ -1101,41 +1086,14 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
     local loc_pct = 0
     local loc_status = "unread"
     if local_path then
-        local found_in_cache = false
-        local ok_bl, BookList = pcall(require, "ui/widget/booklist")
-        local cached_info = ok_bl and BookList and BookList.book_info_cache and BookList.book_info_cache[local_path]
-        if cached_info then
-            local st = cached_info.status
-            local lpct = asNumber(tonumber(cached_info.percent_finished))
-            if (st == "complete" or st == "finished") or (lpct and lpct >= 0.99) then
-                loc_completed = true
-                loc_status = "finished"
-                loc_pct = 1.0
-                found_in_cache = true
-            elseif st == "reading" or (lpct and lpct > 0) then
-                loc_status = "reading"
-                loc_pct = lpct or 0
-                found_in_cache = true
-            end
-        end
-
-        if not found_in_cache then
-            local ok_ds, DocSettings = pcall(require, "docsettings")
-            if ok_ds and DocSettings and DocSettings.open then
-                local ok_o, ds = safeCall("bookDtoToRecord.DocSettings.open", DocSettings.open, DocSettings, local_path)
-                if ok_o and ds and ds.readSetting then
-                    local summary = asTable(ds:readSetting("summary"))
-                    local lpct = asNumber(tonumber(ds:readSetting("percent_finished")))
-                    if (summary and summary.status == "complete") or (lpct and lpct >= 0.99) then
-                        loc_completed = true
-                        loc_status = "finished"
-                        loc_pct = 1.0
-                    elseif (summary and summary.status == "reading") or (lpct and lpct > 0) then
-                        loc_status = "reading"
-                        loc_pct = lpct or 0
-                    end
-                end
-            end
+        local l_st, l_pct = Dedup.checkLocalReadingProgress(local_path)
+        if l_st == "finished" then
+            loc_completed = true
+            loc_status = "finished"
+            loc_pct = 1.0
+        elseif l_st == "reading" then
+            loc_status = "reading"
+            loc_pct = asNumber(tonumber(l_pct)) or 0
         end
     end
 
@@ -1153,10 +1111,9 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
         pct = math.max(srv_pct, loc_pct)
     end
 
-    local ok_sq, SyncQueue = pcall(require, "lib/bridge_sync_queue")
-    if id_str and ok_sq and SyncQueue and SyncQueue.getQueue then
-        local ok_q, q = safeCall("bookDtoToRecord.SyncQueue.getQueue", SyncQueue.getQueue)
-        local queued = ok_q and asTable(q) and asTable(q[id_str]) or nil
+    if id_str then
+        local q = Dedup.scopedSyncQueue()
+        local queued = asTable(q) and asTable(q[id_str]) or nil
         if queued then
             local queued_completed = (queued.completed == true)
             if queued.action == "delete" then
@@ -1168,9 +1125,7 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
                 pct = 1.0
             elseif srv_completed then
                 -- Pure server is finished while queued item is not -> prune stale queue item
-                if SyncQueue.remove then
-                    safeCall("bookDtoToRecord.SyncQueue.remove", SyncQueue.remove, id_str)
-                end
+                Dedup.deferSyncQueueRemove(id_str)
             elseif asNumber(queued.page) and page_count > 0 then
                 local queued_pct = math.min(queued.page / page_count, 0.99)
                 if queued_pct > srv_pct then
@@ -1178,9 +1133,7 @@ local function bookDtoToRecord(dto, fallback_label, fallback_summary, downloaded
                     pct = math.max(queued_pct, loc_pct)
                 else
                     -- Pure server is further or equal -> prune stale queue item
-                    if SyncQueue.remove then
-                        safeCall("bookDtoToRecord.SyncQueue.remove", SyncQueue.remove, id_str)
-                    end
+                    Dedup.deferSyncQueueRemove(id_str)
                 end
             end
         end
@@ -1498,6 +1451,9 @@ processNextCover = function()
                         end
                     end
                 end
+                -- Thumbnail endpoints serve images; the API's JSON Accept header yields HTTP 406.
+                headers["accept"] = nil
+                headers["Accept"] = "image/*"
                 local launched = AsyncHttp.downloadAsync({
                     url = url,
                     headers = headers,
@@ -2076,6 +2032,154 @@ local function isHttp404(ok_res, resp, err)
     return false
 end
 
+-- ---------------------------------------------------------------------------
+-- Series cache memo + cache-first async refresh (ANR fix for large series)
+-- ---------------------------------------------------------------------------
+local SERIES_MEM_TTL = 30
+local _series_mem = { mtime = nil, series = nil, ts = 0 }
+
+function M.invalidateSeriesMemo()
+    _series_mem = { mtime = nil, series = nil, ts = 0 }
+end
+
+-- Parsed `series` table of kokomga_bookshelf.lua, memoized by file mtime (+30s TTL)
+-- so a drill does not re-open/parse the whole settings file every time.
+local function readSeriesCacheTable()
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    if not (ok_ds and DataStorage) then return {} end
+    local path = DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua"
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local mt = (ok_lfs and lfs and lfs.attributes) and lfs.attributes(path, "modification") or nil
+    local now = os.time()
+    if mt and _series_mem.series and _series_mem.mtime == mt and (now - _series_mem.ts) < SERIES_MEM_TTL then
+        return _series_mem.series
+    end
+    local series = {}
+    safeCall("fetchAndMapSeriesBooks.readCache", function()
+        local LuaSettings = require("luasettings")
+        local s = LuaSettings:open(path)
+        local entries = s and s:readSetting("series")
+        if type(entries) == "table" then series = entries end
+    end)
+    if mt then _series_mem = { mtime = mt, series = series, ts = now } end
+    return series
+end
+
+function M.hasCachedSeries(series_id)
+    local e = readSeriesCacheTable()[tostring(series_id)]
+    return type(e) == "table" and type(e.items) == "table" and #e.items > 0
+end
+
+local function seriesItemsSignature(items)
+    local parts = {}
+    for i, b in ipairs(items or {}) do
+        local rp = type(b) == "table" and type(b.readProgress) == "table" and b.readProgress or {}
+        parts[i] = tostring(b.id) .. ":" .. tostring(rp.page or 0) .. ":" .. tostring(rp.completed == true)
+    end
+    return table.concat(parts, "|")
+end
+
+local SERIES_REFRESH_BACKOFF = 60
+local _series_refresh_inflight = {}
+local _series_refresh_failed = {}
+
+local function persistSeriesItems(series_id, items)
+    safeCall("fetchAndMapSeriesBooks.persist", function()
+        local DataStorage = require("datastorage")
+        local LuaSettings = require("luasettings")
+        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
+        if s then
+            local entries = s:readSetting("series") or {}
+            entries[series_id] = { fetched_at = os.time(), items = items }
+            s:saveSetting("series", entries)
+            s:flush()
+        end
+    end)
+    M.invalidateSeriesMemo()
+end
+
+-- Returns true when a refresh is running/backed-off (caller must serve cache, not block);
+-- false when async is unavailable (caller falls back to the synchronous fetch).
+local function scheduleSeriesRefresh(series_id, series_title, old_items)
+    if _series_refresh_inflight[series_id] then return true end
+    local failed_at = _series_refresh_failed[series_id]
+    if failed_at and (os.time() - failed_at) < SERIES_REFRESH_BACKOFF then return true end
+
+    local ok_ah, AsyncHttp = pcall(require, "lib/bridge_async_http")
+    if not (ok_ah and AsyncHttp and AsyncHttp.isAvailable and AsyncHttp.isAvailable() and AsyncHttp.requestAsync) then
+        return false
+    end
+    local ok_js, json = pcall(require, "json")
+    if not (ok_js and json and json.decode) then return false end
+
+    local komga = getKomgaPlugin()
+    local api = (komga and komga.api) or getKomgaApi()
+    local base_url = api and api.base_url
+    if not (api and isAllowedHttpUrl(base_url)) then return false end
+
+    local headers = {}
+    if api.get_headers then
+        local ok_hdr, h = safeCall("scheduleSeriesRefresh.get_headers", api.get_headers, api)
+        if ok_hdr and type(h) == "table" then
+            for k, v in pairs(h) do headers[k] = v end
+        end
+    end
+    local ok_ba, BridgeAuth = pcall(require, "lib/bridge_auth")
+    local url = tostring(base_url):gsub("/+$", "") .. "/api/v1/series/" .. series_id
+        .. "/books?sort=metadata.numberSort%2Casc&page=0&size=1000"
+    if ok_ba and BridgeAuth and BridgeAuth.getAuthHeaders then
+        local ok_ex, extra = safeCall("scheduleSeriesRefresh.getAuthHeaders", BridgeAuth.getAuthHeaders, url)
+        if ok_ex and type(extra) == "table" then
+            for k, v in pairs(extra) do
+                if not headers[k] then headers[k] = v end
+            end
+        end
+    end
+
+    _series_refresh_inflight[series_id] = true
+    local started = AsyncHttp.requestAsync({
+        url = url,
+        headers = headers,
+        connect_timeout = 3,
+        max_time = 25,
+    }, function(ok, code, body, err_msg)
+        _series_refresh_inflight[series_id] = nil
+        if ok and type(body) == "string" and body ~= "" then
+            local ok_d, resp = pcall(json.decode, body)
+            local content = ok_d and type(resp) == "table" and (resp.content or (resp[1] and resp)) or nil
+            if type(content) == "table" and #content > 0 then
+                local new_items = trimBooks(content, 1000)
+                local changed = seriesItemsSignature(new_items) ~= seriesItemsSignature(old_items)
+                persistSeriesItems(series_id, new_items)
+                if changed then
+                    local ok_sp, spec = pcall(require, "lib/hybrid_spec")
+                    if ok_sp and spec and spec.clearCachesForSeries then
+                        pcall(spec.clearCachesForSeries, series_id)
+                    end
+                    scheduleRepaint(true)
+                end
+                return
+            end
+            _series_refresh_failed[series_id] = os.time()
+            return
+        end
+        if tonumber(code) == 404 then
+            M.purgeDeletedSeries(series_id, series_title)
+            M.invalidateSeriesMemo()
+            scheduleRepaint(true)
+            return
+        end
+        _series_refresh_failed[series_id] = os.time()
+        logger.warn(string.format("[Hybrid] async series refresh failed for %s: code=%s err=%s",
+            sanitizeLog(series_id), sanitizeLog(code), sanitizeLog(err_msg)))
+    end)
+    if not started then
+        _series_refresh_inflight[series_id] = nil
+        return false
+    end
+    return true
+end
+
 local function fetchAndMapSeriesBooks(opts)
     local series_id = validateKomgaId(opts and opts.series_id)
     if not series_id then return { books = {}, purged = false } end
@@ -2088,19 +2192,13 @@ local function fetchAndMapSeriesBooks(opts)
 
     local cached_items = nil
     local fetched_at = 0
-    safeCall("fetchAndMapSeriesBooks.readCache", function()
-        local DataStorage = require("datastorage")
-        local LuaSettings = require("luasettings")
-        local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-        if s then
-            local entries = s:readSetting("series") or {}
-            local e = entries[series_id]
-            if e and e.items and #e.items > 0 then
-                cached_items = e.items
-                fetched_at = tonumber(e.fetched_at) or 0
-            end
+    do
+        local e = readSeriesCacheTable()[series_id]
+        if type(e) == "table" and type(e.items) == "table" and #e.items > 0 then
+            cached_items = e.items
+            fetched_at = tonumber(e.fetched_at) or 0
         end
-    end)
+    end
 
     local ttl = 180 -- 3 minutes TTL
     local is_cache_stale = (not cached_items or #cached_items == 0) or ((os.time() - fetched_at) > ttl)
@@ -2125,7 +2223,13 @@ local function fetchAndMapSeriesBooks(opts)
         end
     end
 
-    if is_cache_stale and can_fetch then
+    local refreshed_async = false
+    if is_cache_stale and can_fetch and cached_items and #cached_items > 0 then
+        -- Cache-first: render what we have now; refresh in background (no UI-thread network).
+        refreshed_async = scheduleSeriesRefresh(series_id, series_title, cached_items) == true
+    end
+
+    if is_cache_stale and can_fetch and not refreshed_async then
         local komga = getKomgaPlugin()
         local api = (komga and komga.api) or getKomgaApi()
         if api and type(api.get_books_for_series) == "function" then
@@ -2137,17 +2241,7 @@ local function fetchAndMapSeriesBooks(opts)
                     logger.warn(string.format("[Hybrid] series %s hit 1000-book pagination cap", sanitizeLog(series_id)))
                 end
                 cached_items = trimBooks(content, 1000)
-                safeCall("fetchAndMapSeriesBooks.persist", function()
-                    local DataStorage = require("datastorage")
-                    local LuaSettings = require("luasettings")
-                    local s = LuaSettings:open(DataStorage:getSettingsDir() .. "/kokomga_bookshelf.lua")
-                    if s then
-                        local entries = s:readSetting("series") or {}
-                        entries[series_id] = { fetched_at = os.time(), items = cached_items }
-                        s:saveSetting("series", entries)
-                        s:flush()
-                    end
-                end)
+                persistSeriesItems(series_id, cached_items)
             elseif isHttp404(ok_res, resp, api_err) then
                 M.purgeDeletedSeries(series_id, series_title)
                 return { books = {}, purged = true }

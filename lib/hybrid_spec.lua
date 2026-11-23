@@ -17,6 +17,16 @@ local _series_folder_cache = {}
 local _active_series_cache = {}
 local _active_root_cache = nil
 local ROOT_CACHE_TTL = 30
+local _last_fetch_phases = nil
+
+local function nowMs()
+    local ok_t, ttime = pcall(require, "ui/time")
+    if ok_t and ttime and ttime.now and ttime.to_ms then
+        local ok_v, v = pcall(function() return ttime.to_ms(ttime.now()) end)
+        if ok_v and type(v) == "number" then return v end
+    end
+    return os.clock() * 1000
+end
 
 function M.clearSeriesCache()
     _series_folder_cache = {}
@@ -486,6 +496,9 @@ local SPEC = {
         local root_cache_key = not drill and buildShelfCacheKey(source, "root")
         local series_cache_key = (is_komga_series or is_opds_series) and buildShelfCacheKey(source, tostring(drill.series_id or drill.komga_series_id or drill.path or drill.label or ""))
         local merged = nil
+        local phases = { folder_lookup = 0, repo_getAll = 0, remote = 0, merge = 0, sort = 0, covers = 0 }
+        _last_fetch_phases = phases
+        local t_step = nowMs()
 
         if not drill then
             _active_series_cache = {}
@@ -610,6 +623,7 @@ local SPEC = {
         else
             folder_path = source.local_folder
         end
+        phases.folder_lookup = nowMs() - t_step
 
         local ok_r, Repo = pcall(require, "lib/bookshelf_book_repository")
         if not (ok_r and Repo and Repo.getAll) then return {}, 0 end
@@ -672,6 +686,7 @@ local SPEC = {
         sort_priority = sort_priority or { { key = "filename", reverse = false } }
 
         -- 1. Fetch local records
+        t_step = nowMs()
         local local_books = {}
         if is_komga_series or is_opds_series then
             if folder_path then
@@ -720,6 +735,8 @@ local SPEC = {
         end
 
         -- 2. Fetch all remote records
+        phases.repo_getAll = nowMs() - t_step
+        t_step = nowMs()
         local remote_books, _remote_total
         if is_komga_series or is_opds_series then
             remote_books, _remote_total = Remote.fetchRemote(source, nil, drill, is_spine)
@@ -742,6 +759,8 @@ local SPEC = {
         end
 
         -- 3. Merge and deduplicate
+        phases.remote = nowMs() - t_step
+        t_step = nowMs()
         if (is_komga_series or is_opds_series) and #local_books == 0 then
             merged = remote_books
         else
@@ -865,6 +884,8 @@ local SPEC = {
         end
 
         -- 4. Apply Sort Priority across merged records
+        phases.merge = nowMs() - t_step
+        t_step = nowMs()
         local ok_se, SortEngine = pcall(require, "lib/bookshelf_sort_engine")
         if is_komga_series or is_opds_series then
             -- Series natural reading order: series_index / series_num numerical sort, then natural title/filename
@@ -906,19 +927,24 @@ local SPEC = {
         end
 
         if (is_komga_series or is_opds_series) and series_cache_key and series_cache_key ~= "" then
+            phases.sort = nowMs() - t_step
             _active_series_cache[series_cache_key] = {
                 timestamp = os.time(),
                 books = merged,
             }
         elseif not drill and root_cache_key then
+            phases.sort = nowMs() - t_step
             _active_root_cache = {
                 key = root_cache_key,
                 timestamp = os.time(),
                 books = merged,
             }
+        else
+            phases.sort = nowMs() - t_step
         end
     end
 
+        t_step = nowMs()
         local total = #merged
         local off = offset or 0
         local lim = limit or total
@@ -960,6 +986,7 @@ local SPEC = {
         if #page > 0 and Remote and Remote.scheduleKomgaCovers then
             Remote.scheduleKomgaCovers(page)
         end
+        phases.covers = nowMs() - t_step
 
         return page, total
     end,
@@ -987,8 +1014,11 @@ local SPEC = {
                 has_local_dir = true
             end
 
-            -- If purely remote, check if series is deleted on Komga
-            if not has_local_dir then
+            -- If purely remote, check if series is deleted on Komga.
+            -- Skipped when we already hold a cached book list: the cache-first drill refreshes
+            -- asynchronously and handles 404 without blocking the UI thread.
+            local has_cached = Remote and Remote.hasCachedSeries and Remote.hasCachedSeries(series_id)
+            if not has_local_dir and not has_cached then
                 local ok_bh, BridgeHealth = pcall(require, "lib/bridge_health")
                 local reachable = (not ok_bh or not BridgeHealth or not BridgeHealth.isServerReachable or BridgeHealth.isServerReachable())
                 if reachable then
@@ -1251,6 +1281,7 @@ local SPEC = {
                                     s:saveSetting("series", entries)
                                     s:flush()
                                 end
+                                if Remote and Remote.invalidateSeriesMemo then Remote.invalidateSeriesMemo() end
                             end
                         end)
                     end
@@ -1272,6 +1303,42 @@ local SPEC = {
             or (type(book.filepath) == "string" and (book.filepath:find("^komga://") ~= nil or book.filepath:find("^OPDS://") ~= nil))
     end,
 }
+
+-- Fetch wrapper: per-fetch memo scope (see Dedup.beginFetchScope) + slow-fetch timing log.
+local _fetch_impl = SPEC.fetch
+SPEC.fetch = function(source, drill, offset, limit)
+    local ok_t, ttime = pcall(require, "ui/time")
+    local t0 = (ok_t and ttime and ttime.now) and ttime.now() or nil
+    local c0 = os.clock()
+    Dedup.beginFetchScope()
+    local packed = { pcall(_fetch_impl, source, drill, offset, limit) }
+    Dedup.endFetchScope()
+    local ms
+    if t0 then
+        local ok_ms, v = pcall(function() return ttime.to_ms(ttime.since(t0)) end)
+        ms = ok_ms and v or nil
+    end
+    ms = ms or ((os.clock() - c0) * 1000)
+    if ms > 300 then
+        local ph = _last_fetch_phases or {}
+        logger.info(string.format(
+            "[Hybrid] fetch timing: %.0fms (folder_lookup=%.0fms repo_getAll=%.0fms remote=%.0fms merge=%.0fms sort=%.0fms covers=%.0fms) drill=%s label=%s",
+            ms,
+            ph.folder_lookup or 0,
+            ph.repo_getAll or 0,
+            ph.remote or 0,
+            ph.merge or 0,
+            ph.sort or 0,
+            ph.covers or 0,
+            tostring(drill and drill.kind),
+            tostring(drill and drill.label)
+        ))
+    end
+    if not packed[1] then
+        error(packed[2], 0)
+    end
+    return unpack(packed, 2, table.maxn(packed))
+end
 
 function M.installSourceForwarding()
     local ok_s, Sources = pcall(require, "lib/bookshelf_sources")
